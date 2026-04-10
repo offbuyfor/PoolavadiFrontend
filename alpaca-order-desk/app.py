@@ -134,7 +134,8 @@ ALPACA_HEADERS = {
 def alpaca_post(endpoint: str, payload: dict) -> dict:
     url = f"{ALPACA_BASE_URL}{endpoint}"
     resp = requests.post(url, json=payload, headers=ALPACA_HEADERS, timeout=10)
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(f"{resp.status_code} {resp.reason}: {resp.text} | Payload: {payload}")
     return resp.json()
 
 
@@ -188,14 +189,20 @@ def submit_step2(trade: dict) -> dict:
     return alpaca_post("/v2/orders", payload)
 
 
-def submit_step3(trade: dict) -> dict:
-    """Closing order: reverse of Step 2 @ Close_Price + options_price."""
+def submit_step3(trade: dict, step1_avg_fill: float, step2_avg_fill: float) -> dict:
+    """Closing order using actual fill prices.
+    CALL: buy @ step2_avg_stock - step1_avg_option  (recover option cost from stock gain)
+    PUT:  sell @ step2_avg_stock + step1_avg_option (recover option cost from stock sale)
+    """
     is_call = trade["option_type"].lower() == "call"
-    limit_price = round(float(trade["Close_Price"]) + float(trade["options_price"]), 2)
+    if is_call:
+        limit_price = round(step2_avg_fill - step1_avg_fill, 2)
+    else:
+        limit_price = round(step2_avg_fill + step1_avg_fill, 2)
     payload = {
         "symbol":        trade["ticker"].upper(),
         "qty":           "100",
-        "side":          "buy" if is_call else "sell",  # call: close short; put: close long
+        "side":          "buy" if is_call else "sell",
         "type":          "limit",
         "limit_price":   str(limit_price),
         "time_in_force": "gtc",
@@ -235,9 +242,18 @@ def get_step_status(log_rows: list[dict], ticker: str, option_type: str, step: i
 # ---------------------------------------------------------------------------
 def refresh_all_statuses(client, log_rows: list[dict]) -> int:
     updated = 0
-    for row in log_rows:
-        if row.get("status") not in ("submitted",):
+    # Build set of latest row per (ticker, option_type, step) — only poll if latest is still "submitted"
+    seen = set()
+    rows_to_poll = []
+    for row in sorted(log_rows, key=lambda r: r.get("submitted_at") or "", reverse=True):
+        key = (row.get("ticker"), row.get("option_type"), row.get("step"))
+        if key in seen:
             continue
+        seen.add(key)
+        if row.get("status") == "submitted":
+            rows_to_poll.append(row)
+
+    for row in rows_to_poll:
         order_id = row.get("alpaca_order_id")
         if not order_id:
             continue
@@ -289,7 +305,16 @@ def do_approve(client, trade: dict, step: int, log_rows: list[dict]):
         elif step == 2:
             resp = submit_step2(trade)
         else:
-            resp = submit_step3(trade)
+            # Fetch actual avg fill prices from Alpaca for Steps 1 & 2
+            s1_row = get_step_status(log_rows, trade["ticker"], trade["option_type"], 1)
+            s2_row = get_step_status(log_rows, trade["ticker"], trade["option_type"], 2)
+            if not s1_row or not s2_row:
+                raise RuntimeError("Cannot find Step 1 or Step 2 log entries.")
+            s1_order = alpaca_get_order(s1_row["alpaca_order_id"])
+            s2_order = alpaca_get_order(s2_row["alpaca_order_id"])
+            step1_avg = float(s1_order.get("filled_avg_price") or s1_order.get("limit_price") or trade["options_price"])
+            step2_avg = float(s2_order.get("filled_avg_price") or s2_order.get("limit_price") or trade["Close_Price"])
+            resp = submit_step3(trade, step1_avg, step2_avg)
 
         row = {**base, "alpaca_order_id": resp.get("id", ""), "status": "submitted"}
         ensure_log_table(client)
@@ -330,92 +355,76 @@ def do_reject(client, trade: dict, step: int, log_rows: list[dict]):
 # ---------------------------------------------------------------------------
 # UI rendering
 # ---------------------------------------------------------------------------
-def render_step_row(
-    client,
-    trade: dict,
-    step: int,
-    label: str,
-    details: str,
-    log_rows: list[dict],
-    unlocked: bool,
-):
+def render_step_cell(client, trade: dict, step: int, details: str, log_rows: list[dict], unlocked: bool):
     ticker      = trade["ticker"]
     option_type = trade["option_type"]
     log_row     = get_step_status(log_rows, ticker, option_type, step)
     status      = log_row["status"] if log_row else "pending_approval"
     badge       = STATUS_BADGE.get(status, status)
 
-    col1, col2, col3 = st.columns([4, 2, 2])
-    with col1:
-        st.markdown(f"**Step {step} — {label}**  \n{details}")
-        st.caption(badge)
-    with col2:
-        if not unlocked:
-            st.markdown("🔒 Locked")
-        elif status in ("submitted", "filled", "rejected", "failed"):
-            st.markdown(f"_{badge}_")
-        else:
-            key_approve = f"approve_{ticker}_{option_type}_{step}"
-            if st.button("✅ Approve", key=key_approve):
+    if not unlocked:
+        st.caption("🔒 Locked")
+        return
+
+    st.caption(f"{details}")
+    st.caption(badge)
+
+    if status == "pending_approval":
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("✅", key=f"approve_{ticker}_{option_type}_{step}", help="Approve", use_container_width=True):
                 do_approve(client, trade, step, log_rows)
                 st.rerun()
-    with col3:
-        if unlocked and status == "pending_approval":
-            key_reject = f"reject_{ticker}_{option_type}_{step}"
-            if st.button("❌ Reject", key=key_reject):
+        with b2:
+            if st.button("❌", key=f"reject_{ticker}_{option_type}_{step}", help="Reject", use_container_width=True):
                 do_reject(client, trade, step, log_rows)
                 st.rerun()
 
 
-def render_trade_card(client, trade: dict, log_rows: list[dict]):
+def render_table_header():
+    cols = st.columns([1, 1, 1, 1, 1, 2, 2, 2])
+    labels = ["Type", "Ticker", "Conf%", "Strike", "Expiry", "Step 1", "Step 2", "Step 3"]
+    for col, label in zip(cols, labels):
+        col.markdown(f"**{label}**")
+    st.divider()
+
+
+def render_trade_row(client, trade: dict, log_rows: list[dict]):
     ticker      = trade["ticker"]
     option_type = trade["option_type"].upper()
     conf        = float(trade.get("prediction_prob", 0)) * 100
     expiry      = trade.get("Option_Expiry_Date", "")
     strike      = trade.get("calls_strike", "")
-    premium     = trade.get("options_price", "")
-    close       = trade.get("Close_Price", "")
-    step3_limit = round(float(close or 0) + float(premium or 0), 2)
+
+    s1 = get_step_status(log_rows, ticker, trade["option_type"], 1)
+    s2 = get_step_status(log_rows, ticker, trade["option_type"], 2)
+    s1_status = s1["status"] if s1 else "pending_approval"
+    s2_status = s2["status"] if s2 else "pending_approval"
+
+    if option_type == "CALL":
+        step1_details = f"Buy 1 CALL @ ${strike}"
+        step2_details = f"Sell 100 shares @ mkt"
+        step3_details = f"Buy 100 @ (S2 fill − S1 fill)"
+    else:
+        step1_details = f"Buy 1 PUT @ ${strike}"
+        step2_details = f"Buy 100 shares @ mkt"
+        step3_details = f"Sell 100 @ (S2 fill + S1 fill)"
 
     badge_color = "#1a6e3c" if option_type == "CALL" else "#6e1a1a"
-    header = (
-        f'<span style="background:{badge_color};padding:2px 8px;border-radius:4px;'
-        f'font-weight:bold;">{option_type}</span> &nbsp;'
-        f'**{ticker}** &nbsp;|&nbsp; Conf: {conf:.1f}% &nbsp;|&nbsp; '
-        f'Expiry: {expiry} &nbsp;|&nbsp; Strike: ${strike}'
-    )
+    type_badge  = f'<span style="background:{badge_color};padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold;">{option_type}</span>'
 
-    with st.expander(f"{option_type}  {ticker}  |  {conf:.1f}%  |  Strike ${strike}  |  Exp {expiry}", expanded=True):
-        st.markdown(header, unsafe_allow_html=True)
-        st.markdown("---")
+    c_type, c_ticker, c_conf, c_strike, c_expiry, c_s1, c_s2, c_s3 = st.columns([1, 1, 1, 1, 1, 2, 2, 2])
 
-        # Determine step statuses
-        s1 = get_step_status(log_rows, ticker, trade["option_type"], 1)
-        s2 = get_step_status(log_rows, ticker, trade["option_type"], 2)
-        s1_status = s1["status"] if s1 else "pending_approval"
-        s2_status = s2["status"] if s2 else "pending_approval"
+    with c_type:    st.markdown(type_badge, unsafe_allow_html=True)
+    with c_ticker:  st.markdown(f"**{ticker}**")
+    with c_conf:    st.markdown(f"{conf:.1f}%")
+    with c_strike:  st.markdown(f"${strike}")
+    with c_expiry:  st.markdown(str(expiry))
+    with c_s1:      render_step_cell(client, trade, 1, step1_details, log_rows, unlocked=True)
+    with c_s2:      render_step_cell(client, trade, 2, step2_details, log_rows, unlocked=(s1_status == "filled"))
+    with c_s3:      render_step_cell(client, trade, 3, step3_details, log_rows, unlocked=(s2_status == "filled"))
 
-        # Step 1 details
-        if option_type == "CALL":
-            step1_label   = "Buy CALL Option"
-            step1_details = f"Buy 1 CALL contract @ strike ${strike}, expiry {expiry}, premium ~${premium}"
-            step2_label   = "Married Put — Sell Shares"
-            step2_details = f"Sell 100 shares of {ticker} @ market"
-            step3_label   = "Closing — Buy Shares"
-            step3_details = f"Buy 100 shares of {ticker} @ limit ${step3_limit} (${close} + ${premium} premium)"
-        else:
-            step1_label   = "Buy PUT Option"
-            step1_details = f"Buy 1 PUT contract @ strike ${strike}, expiry {expiry}, premium ~${premium}"
-            step2_label   = "Married Call — Buy Shares"
-            step2_details = f"Buy 100 shares of {ticker} @ market"
-            step3_label   = "Closing — Sell Shares"
-            step3_details = f"Sell 100 shares of {ticker} @ limit ${step3_limit} (${close} + ${premium} premium)"
-
-        render_step_row(client, trade, 1, step1_label, step1_details, log_rows, unlocked=True)
-        st.divider()
-        render_step_row(client, trade, 2, step2_label, step2_details, log_rows, unlocked=(s1_status == "filled"))
-        st.divider()
-        render_step_row(client, trade, 3, step3_label, step3_details, log_rows, unlocked=(s2_status == "filled"))
+    st.divider()
 
 
 # ---------------------------------------------------------------------------
@@ -482,9 +491,9 @@ def main():
     st.caption(f"{len(trades)} trade(s) loaded for snapshot date: {trades[0].get('snapshot_date', 'N/A')}")
     st.markdown("---")
 
+    render_table_header()
     for trade in trades:
-        render_trade_card(client, trade, log_rows)
-        st.markdown("<br>", unsafe_allow_html=True)
+        render_trade_row(client, trade, log_rows)
 
 
 if __name__ == "__main__":
