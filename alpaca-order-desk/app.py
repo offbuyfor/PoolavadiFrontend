@@ -77,11 +77,11 @@ def fetch_trades(client) -> list[dict]:
             Option_Expiry_Date,
             prediction_prob
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_SOURCE_TABLE}`
-        WHERE evaluation_status = 'PENDING_NEXT_DAY_DATA'
+        WHERE CAST(evaluation_status AS STRING) = 'PENDING_NEXT_DAY_DATA'
           AND snapshot_date = (
               SELECT MAX(snapshot_date)
               FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_SOURCE_TABLE}`
-              WHERE evaluation_status = 'PENDING_NEXT_DAY_DATA'
+              WHERE CAST(evaluation_status AS STRING) = 'PENDING_NEXT_DAY_DATA'
           )
         ORDER BY prediction_prob DESC
     """
@@ -114,7 +114,7 @@ def write_log_row(client, row: dict):
     if errors:
         raise RuntimeError(f"BQ insert errors: {errors}")
 
-
+    
 def append_status_row(client, original_row: dict, updates: dict):
     """Append a new status row instead of updating (avoids streaming buffer DML error)."""
     new_row = {**original_row, **updates, "id": str(uuid.uuid4())}
@@ -279,6 +279,12 @@ def refresh_all_statuses(client, log_rows: list[dict]) -> int:
                 if filled_at:
                     row["filled_at"] = filled_at
                 updated += 1
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                # Order belongs to a previous account — skip silently
+                pass
+            else:
+                st.warning(f"Alpaca poll error for order {order_id}: {e}")
         except Exception as e:
             st.warning(f"Alpaca poll error for order {order_id}: {e}")
     return updated
