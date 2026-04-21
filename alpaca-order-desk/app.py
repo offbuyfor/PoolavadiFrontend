@@ -75,6 +75,7 @@ def fetch_trades(client) -> list[dict]:
             options_price,
             Close_Price,
             Option_Expiry_Date,
+            Earnings_Date,
             prediction_prob
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_SOURCE_TABLE}`
         WHERE CAST(evaluation_status AS STRING) = 'PENDING_NEXT_DAY_DATA'
@@ -189,10 +190,26 @@ def submit_step2(trade: dict) -> dict:
     return alpaca_post("/v2/orders", payload)
 
 
+def _use_extended_hours(trade: dict) -> bool:
+    """Extended hours = True unless earnings are today PM or tomorrow AM."""
+    from datetime import date, timedelta
+    raw = trade.get("Earnings_Date")
+    if raw is None:
+        return True
+    try:
+        earnings = raw if isinstance(raw, date) else datetime.strptime(str(raw), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return True
+    today    = date.today()
+    tomorrow = today + timedelta(days=1)
+    return earnings not in (today, tomorrow)
+
+
 def submit_step3(trade: dict, step1_avg_fill: float, step2_avg_fill: float) -> dict:
     """Closing order using actual fill prices.
     CALL: buy @ step2_avg_stock - step1_avg_option  (recover option cost from stock gain)
     PUT:  sell @ step2_avg_stock + step1_avg_option (recover option cost from stock sale)
+    Extended hours disabled when earnings are today PM or tomorrow AM.
     """
     is_call = trade["option_type"].lower() == "call"
     if is_call:
@@ -200,12 +217,13 @@ def submit_step3(trade: dict, step1_avg_fill: float, step2_avg_fill: float) -> d
     else:
         limit_price = round(step2_avg_fill + step1_avg_fill, 2)
     payload = {
-        "symbol":        trade["ticker"].upper(),
-        "qty":           "100",
-        "side":          "buy" if is_call else "sell",
-        "type":          "limit",
-        "limit_price":   str(limit_price),
-        "time_in_force": "gtc",
+        "symbol":          trade["ticker"].upper(),
+        "qty":             "100",
+        "side":            "buy" if is_call else "sell",
+        "type":            "limit",
+        "limit_price":     str(limit_price),
+        "time_in_force":   "gtc",
+        "extended_hours":  _use_extended_hours(trade),
     }
     return alpaca_post("/v2/orders", payload)
 
