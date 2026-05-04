@@ -669,7 +669,7 @@ def render_step_cell(client, trade: dict, step: int, details: str, log_rows: lis
 
 
 def render_table_header():
-    cols = st.columns([1, 1, 1, 1, 1, 2, 2, 2])
+    cols = st.columns([1, 1, 1, 1, 1, 4, 2, 2])
     labels = ["Type", "Ticker", "Conf%", "Strike", "Expiry", "Step 1", "Step 2", "Step 3"]
     for col, label in zip(cols, labels):
         col.markdown(f"**{label}**")
@@ -700,7 +700,7 @@ def render_trade_row(client, trade: dict, log_rows: list[dict]):
     badge_color = "#1a6e3c" if option_type == "CALL" else "#6e1a1a"
     type_badge  = f'<span style="background:{badge_color};padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold;">{option_type}</span>'
 
-    c_type, c_ticker, c_conf, c_strike, c_expiry, c_s1, c_s2, c_s3 = st.columns([1, 1, 1, 1, 1, 2, 2, 2])
+    c_type, c_ticker, c_conf, c_strike, c_expiry, c_s1, c_s2, c_s3 = st.columns([1, 1, 1, 1, 1, 4, 2, 2])
 
     with c_type:    st.markdown(type_badge, unsafe_allow_html=True)
     with c_ticker:  st.markdown(f"**{ticker}**")
@@ -720,6 +720,22 @@ def render_trade_row(client, trade: dict, log_rows: list[dict]):
 def main():
     st.set_page_config(page_title="Order Desk", layout="wide")
     st.title("Order Desk")
+
+    # Liquidity thresholds legend
+    st.markdown(
+        """
+        <div style="background:#1e1e1e;border:1px solid #333;border-radius:6px;
+                    padding:8px 16px;font-size:13px;margin-bottom:8px;">
+          <b>Liquidity thresholds</b> &nbsp;|&nbsp;
+          <b>Spread %</b>: 🟢 &lt;5% &nbsp; 🟡 5–15% &nbsp; 🔴 &gt;15%
+          &nbsp;&nbsp;|&nbsp;&nbsp;
+          <b>Open Interest</b>: 🟢 &gt;1000 &nbsp; 🟡 500–1000 &nbsp; 🔴 &lt;500
+          &nbsp;&nbsp;|&nbsp;&nbsp;
+          <b>Volume</b>: 🟢 &gt;100 &nbsp; 🟡 50–100 &nbsp; 🔴 &lt;50
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # Credential check
     if MISSING_CREDS:
