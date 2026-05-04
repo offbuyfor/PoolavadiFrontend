@@ -364,7 +364,18 @@ def get_step_status(log_rows: list[dict], ticker: str, option_type: str, step: i
     if not matches:
         return None
     # Sort by submitted_at descending, handle None
-    matches.sort(key=lambda r: r.get("submitted_at") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    def _sort_key(r):
+        v = r.get("submitted_at")
+        if isinstance(v, datetime):
+            return v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    matches.sort(key=_sort_key, reverse=True)
     return matches[0]
 
 
