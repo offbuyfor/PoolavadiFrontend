@@ -151,6 +151,14 @@ def alpaca_get_order(order_id: str) -> dict:
     return resp.json()
 
 
+def alpaca_cancel_order(order_id: str) -> None:
+    url = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
+    resp = requests.delete(url, headers=ALPACA_HEADERS, timeout=10)
+    # 204 = cancelled, 422 = already filled/cancelled — both are acceptable
+    if resp.status_code not in (204, 422):
+        resp.raise_for_status()
+
+
 def build_option_symbol(ticker: str, expiry, option_type: str, strike: float) -> str:
     """OCC symbol: TICKER + YYMMDD + C/P + strike*1000 zero-padded to 8 digits."""
     if hasattr(expiry, "strftime"):
@@ -468,6 +476,95 @@ def do_reject(client, trade: dict, step: int, log_rows: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# Step 1 retry helpers
+# ---------------------------------------------------------------------------
+
+def get_option_ask(symbol: str, fallback_price: float) -> float:
+    """Return the current ask price, falling back to fallback_price."""
+    try:
+        url  = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
+        resp = requests.get(url, params={"symbols": symbol},
+                            headers=ALPACA_HEADERS, timeout=10)
+        resp.raise_for_status()
+        ask = float(resp.json().get("quotes", {}).get(symbol, {}).get("ap", 0) or 0)
+        if ask > 0:
+            return round(ask, 2)
+    except Exception:
+        pass
+    return round(float(fallback_price), 2)
+
+
+def do_retry_step1(client, trade: dict, log_rows: list[dict], mode: str):
+    """
+    Cancel the current Step 1 order and re-submit.
+    mode: 'ask' → limit at current ask  |  'market' → market order
+    """
+    ticker      = trade["ticker"]
+    option_type = trade["option_type"]
+    log_row     = get_step_status(log_rows, ticker, option_type, 1)
+    if not log_row or not log_row.get("alpaca_order_id"):
+        st.error("No Step 1 order found to cancel.")
+        return
+
+    old_order_id = log_row["alpaca_order_id"]
+    symbol = build_option_symbol(
+        ticker, trade["Option_Expiry_Date"], option_type, trade["calls_strike"],
+    )
+    base = {
+        "id":            str(uuid.uuid4()),
+        "snapshot_date": str(trade["snapshot_date"]),
+        "ticker":        ticker,
+        "option_type":   option_type,
+        "step":          1,
+        "submitted_at":  datetime.now(timezone.utc).isoformat(),
+        "filled_at":     None,
+        "error_message": None,
+    }
+    try:
+        alpaca_cancel_order(old_order_id)
+
+        if mode == "ask":
+            ask_price = get_option_ask(symbol, trade.get("options_price", 1.00))
+            payload = {
+                "symbol":        symbol,
+                "qty":           "1",
+                "side":          "buy",
+                "type":          "limit",
+                "limit_price":   str(ask_price),
+                "time_in_force": "day",
+                "asset_class":   "option",
+            }
+            label = f"limit at ask ${ask_price}"
+        else:
+            payload = {
+                "symbol":        symbol,
+                "qty":           "1",
+                "side":          "buy",
+                "type":          "market",
+                "time_in_force": "day",
+                "asset_class":   "option",
+            }
+            label = "market order"
+
+        resp = alpaca_post("/v2/orders", payload)
+        row  = {**base, "alpaca_order_id": resp.get("id", ""), "status": "submitted"}
+        ensure_log_table(client)
+        write_log_row(client, row)
+        log_rows.append(row)
+        st.success(f"Retried Step 1 as {label} — new order ID: {resp.get('id')}")
+
+    except Exception as e:
+        row = {**base, "alpaca_order_id": None, "status": "failed", "error_message": str(e)}
+        ensure_log_table(client)
+        try:
+            write_log_row(client, row)
+        except Exception:
+            pass
+        log_rows.append(row)
+        st.error(f"Retry failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # UI rendering
 # ---------------------------------------------------------------------------
 VERDICT_STYLE = {
@@ -553,6 +650,22 @@ def render_step_cell(client, trade: dict, step: int, details: str, log_rows: lis
             if st.button("❌", key=f"reject_{ticker}_{option_type}_{step}", help="Reject", use_container_width=True):
                 do_reject(client, trade, step, log_rows)
                 st.rerun()
+
+    if status == "submitted" and step == 1:
+        with st.expander("Order not filling? Retry"):
+            st.caption("Cancels current order and re-submits.")
+            r1, r2 = st.columns(2)
+            with r1:
+                if st.button("Retry at Ask", key=f"retry_ask_{ticker}_{option_type}",
+                             use_container_width=True, help="Limit order at current ask price"):
+                    do_retry_step1(client, trade, log_rows, mode="ask")
+                    st.rerun()
+            with r2:
+                if st.button("Retry at Market", key=f"retry_mkt_{ticker}_{option_type}",
+                             use_container_width=True, type="secondary",
+                             help="Last resort — fills at any price"):
+                    do_retry_step1(client, trade, log_rows, mode="market")
+                    st.rerun()
 
 
 def render_table_header():
