@@ -125,6 +125,8 @@ def append_status_row(client, original_row: dict, updates: dict):
 # ---------------------------------------------------------------------------
 # Alpaca helpers
 # ---------------------------------------------------------------------------
+ALPACA_DATA_URL = "https://data.alpaca.markets"
+
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID":     ALPACA_API_KEY,
     "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
@@ -158,21 +160,44 @@ def build_option_symbol(ticker: str, expiry, option_type: str, strike: float) ->
     return f"{ticker.upper()}{exp_str}{cp}{strike_int:08d}"
 
 
+def get_option_midpoint(symbol: str, fallback_price: float) -> float:
+    """Fetch latest bid/ask for an option and return the midpoint.
+    Falls back to fallback_price if the quote is unavailable."""
+    try:
+        url  = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
+        resp = requests.get(url, params={"symbols": symbol},
+                            headers=ALPACA_HEADERS, timeout=10)
+        resp.raise_for_status()
+        data  = resp.json()
+        quote = data.get("quotes", {}).get(symbol, {})
+        bid   = float(quote.get("bp", 0) or 0)
+        ask   = float(quote.get("ap", 0) or 0)
+        if bid > 0 and ask > 0:
+            mid = round((bid + ask) / 2, 2)
+            return max(mid, 0.01)
+    except Exception:
+        pass
+    return round(float(fallback_price), 2)
+
+
 def submit_step1(trade: dict) -> dict:
-    """Buy option contract (call or put)."""
+    """Buy option contract at limit = midpoint of current bid/ask.
+    Falls back to the quoted premium from BQ if the quote is unavailable."""
     symbol = build_option_symbol(
         trade["ticker"],
         trade["Option_Expiry_Date"],
         trade["option_type"],
         trade["calls_strike"],
     )
+    limit_price = get_option_midpoint(symbol, trade.get("options_price", 1.00))
     payload = {
-        "symbol":      symbol,
-        "qty":         "1",
-        "side":        "buy",
-        "type":        "market",
+        "symbol":        symbol,
+        "qty":           "1",
+        "side":          "buy",
+        "type":          "limit",
+        "limit_price":   str(limit_price),
         "time_in_force": "day",
-        "asset_class": "option",
+        "asset_class":   "option",
     }
     return alpaca_post("/v2/orders", payload)
 
