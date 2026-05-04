@@ -76,7 +76,9 @@ def fetch_trades(client) -> list[dict]:
             Close_Price,
             Option_Expiry_Date,
             Earnings_Date,
-            prediction_prob
+            prediction_prob,
+            calls_OpenInterest,
+            Volume
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_SOURCE_TABLE}`
         WHERE CAST(evaluation_status AS STRING) = 'PENDING_NEXT_DAY_DATA'
           AND snapshot_date = (
@@ -178,6 +180,70 @@ def get_option_midpoint(symbol: str, fallback_price: float) -> float:
     except Exception:
         pass
     return round(float(fallback_price), 2)
+
+
+LIQUIDITY_THRESHOLDS = {
+    "spread_pct": {"green": 5.0,  "yellow": 15.0},   # % of midpoint
+    "open_interest": {"green": 1000, "yellow": 500},  # contracts
+    "volume":        {"green": 100,  "yellow": 50},   # contracts today
+}
+
+
+def get_option_liquidity(symbol: str, oi, volume) -> dict:
+    """
+    Fetch live bid/ask and combine with OI/Volume to produce a liquidity report.
+    Returns a dict with: bid, ask, spread_pct, open_interest, volume,
+                         ratings (green/yellow/red per metric), overall verdict.
+    """
+    result = {
+        "bid": None, "ask": None, "mid": None, "spread_pct": None,
+        "open_interest": int(oi or 0),
+        "volume":        int(volume or 0),
+        "ratings": {},
+        "verdict": "UNKNOWN",
+        "error": None,
+    }
+    try:
+        url  = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
+        resp = requests.get(url, params={"symbols": symbol},
+                            headers=ALPACA_HEADERS, timeout=10)
+        resp.raise_for_status()
+        quote = resp.json().get("quotes", {}).get(symbol, {})
+        bid   = float(quote.get("bp", 0) or 0)
+        ask   = float(quote.get("ap", 0) or 0)
+        if bid > 0 and ask > 0:
+            mid              = (bid + ask) / 2
+            result["bid"]    = round(bid, 2)
+            result["ask"]    = round(ask, 2)
+            result["mid"]    = round(mid, 2)
+            result["spread_pct"] = round((ask - bid) / mid * 100, 1)
+    except Exception as e:
+        result["error"] = str(e)
+
+    def rate(key, value):
+        if value is None:
+            return "grey"
+        t = LIQUIDITY_THRESHOLDS[key]
+        if key == "spread_pct":
+            return "green" if value <= t["green"] else ("yellow" if value <= t["yellow"] else "red")
+        else:
+            return "green" if value >= t["green"] else ("yellow" if value >= t["yellow"] else "red")
+
+    result["ratings"]["spread_pct"]    = rate("spread_pct",    result["spread_pct"])
+    result["ratings"]["open_interest"] = rate("open_interest", result["open_interest"])
+    result["ratings"]["volume"]        = rate("volume",        result["volume"])
+
+    ratings = list(result["ratings"].values())
+    if "red" in ratings:
+        result["verdict"] = "ILLIQUID"
+    elif "yellow" in ratings:
+        result["verdict"] = "CAUTION"
+    elif "grey" in ratings:
+        result["verdict"] = "UNKNOWN"
+    else:
+        result["verdict"] = "LIQUID"
+
+    return result
 
 
 def submit_step1(trade: dict) -> dict:
@@ -404,6 +470,62 @@ def do_reject(client, trade: dict, step: int, log_rows: list[dict]):
 # ---------------------------------------------------------------------------
 # UI rendering
 # ---------------------------------------------------------------------------
+VERDICT_STYLE = {
+    "LIQUID":   ("🟢", "normal"),
+    "CAUTION":  ("🟡", "off"),
+    "ILLIQUID": ("🔴", "inverse"),
+    "UNKNOWN":  ("⚪", "off"),
+}
+RATING_ICON = {"green": "🟢", "yellow": "🟡", "red": "🔴", "grey": "⚪"}
+
+
+def render_liquidity_panel(trade: dict):
+    """Fetch and display liquidity metrics for Step 1 options."""
+    symbol = build_option_symbol(
+        trade["ticker"], trade["Option_Expiry_Date"],
+        trade["option_type"], trade["calls_strike"],
+    )
+    cache_key = f"liq_{symbol}"
+    if cache_key not in st.session_state:
+        with st.spinner("Checking liquidity…"):
+            st.session_state[cache_key] = get_option_liquidity(
+                symbol,
+                trade.get("calls_OpenInterest"),
+                trade.get("Volume"),
+            )
+    liq = st.session_state[cache_key]
+
+    verdict      = liq["verdict"]
+    verdict_icon, verdict_type = VERDICT_STYLE.get(verdict, ("⚪", "off"))
+
+    with st.expander(f"{verdict_icon} Liquidity: **{verdict}**  `{symbol}`", expanded=(verdict != "LIQUID")):
+        if liq["error"] and liq["bid"] is None:
+            st.caption(f"Could not fetch live quote: {liq['error']}")
+
+        c1, c2, c3 = st.columns(3)
+        # Spread %
+        spread_icon = RATING_ICON[liq["ratings"]["spread_pct"]]
+        spread_val  = f"{liq['spread_pct']}%" if liq["spread_pct"] is not None else "N/A"
+        spread_sub  = (f"Bid ${liq['bid']} / Ask ${liq['ask']}"
+                       if liq["bid"] else "No live quote")
+        c1.metric(f"{spread_icon} Spread", spread_val, spread_sub,
+                  delta_color="off")
+
+        # Open Interest
+        oi_icon = RATING_ICON[liq["ratings"]["open_interest"]]
+        c2.metric(f"{oi_icon} Open Interest", f"{liq['open_interest']:,}",
+                  "≥1000 liquid", delta_color="off")
+
+        # Volume
+        vol_icon = RATING_ICON[liq["ratings"]["volume"]]
+        c3.metric(f"{vol_icon} Volume", f"{liq['volume']:,}",
+                  "≥100 liquid", delta_color="off")
+
+        if st.button("↻ Refresh quote", key=f"liq_refresh_{symbol}"):
+            del st.session_state[cache_key]
+            st.rerun()
+
+
 def render_step_cell(client, trade: dict, step: int, details: str, log_rows: list[dict], unlocked: bool):
     ticker      = trade["ticker"]
     option_type = trade["option_type"]
@@ -419,6 +541,9 @@ def render_step_cell(client, trade: dict, step: int, details: str, log_rows: lis
     st.caption(badge)
 
     if status == "pending_approval":
+        if step == 1:
+            render_liquidity_panel(trade)
+
         b1, b2 = st.columns(2)
         with b1:
             if st.button("✅", key=f"approve_{ticker}_{option_type}_{step}", help="Approve", use_container_width=True):
