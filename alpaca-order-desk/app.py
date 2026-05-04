@@ -199,9 +199,8 @@ LIQUIDITY_THRESHOLDS = {
 
 def get_option_liquidity(symbol: str, oi, volume) -> dict:
     """
-    Fetch live bid/ask and combine with OI/Volume to produce a liquidity report.
-    Returns a dict with: bid, ask, spread_pct, open_interest, volume,
-                         ratings (green/yellow/red per metric), overall verdict.
+    Fetch live bid/ask, open interest, and volume from Alpaca snapshots endpoint.
+    Falls back to BQ values for OI/volume if the snapshot is unavailable.
     """
     result = {
         "bid": None, "ask": None, "mid": None, "spread_pct": None,
@@ -212,19 +211,34 @@ def get_option_liquidity(symbol: str, oi, volume) -> dict:
         "error": None,
     }
     try:
-        url  = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
+        url  = f"{ALPACA_DATA_URL}/v1beta1/options/snapshots"
         resp = requests.get(url, params={"symbols": symbol},
                             headers=ALPACA_HEADERS, timeout=10)
         resp.raise_for_status()
-        quote = resp.json().get("quotes", {}).get(symbol, {})
+        snap = resp.json().get("snapshots", {}).get(symbol, {})
+
+        # Bid / ask from latestQuote
+        quote = snap.get("latestQuote", {})
         bid   = float(quote.get("bp", 0) or 0)
         ask   = float(quote.get("ap", 0) or 0)
         if bid > 0 and ask > 0:
-            mid              = (bid + ask) / 2
-            result["bid"]    = round(bid, 2)
-            result["ask"]    = round(ask, 2)
-            result["mid"]    = round(mid, 2)
+            mid                  = (bid + ask) / 2
+            result["bid"]        = round(bid, 2)
+            result["ask"]        = round(ask, 2)
+            result["mid"]        = round(mid, 2)
             result["spread_pct"] = round((ask - bid) / mid * 100, 1)
+
+        # Live open interest from snapshot (overrides BQ value)
+        live_oi = snap.get("openInterest") or snap.get("open_interest")
+        if live_oi is not None:
+            result["open_interest"] = int(live_oi)
+
+        # Live volume from snapshot daily bar if available
+        daily_bar = snap.get("dailyBar", {})
+        live_vol  = daily_bar.get("v")
+        if live_vol is not None:
+            result["volume"] = int(live_vol)
+
     except Exception as e:
         result["error"] = str(e)
 
