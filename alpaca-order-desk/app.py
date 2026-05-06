@@ -624,14 +624,22 @@ def do_retry_step1(client, trade: dict, log_rows: list[dict], mode: str):
 # Investment summary
 # ---------------------------------------------------------------------------
 
-def render_investment_summary(log_rows: list[dict]):
+def render_investment_summary(log_rows: list[dict], trades: list[dict]):
     """
     Show a summary bar: filled / pending / cancelled counts and
     actual capital deployed fetched from Alpaca fill prices.
+    Scoped to the current snapshot date only.
     """
-    step1_rows = [r for r in log_rows if int(r.get("step", 0)) == 1]
+    # Scope to current snapshot date from the loaded trades
+    snapshot_dates = {str(t.get("snapshot_date", "")) for t in trades}
 
-    # Latest status per ticker/option_type
+    step1_rows = [
+        r for r in log_rows
+        if int(r.get("step") or 0) == 1
+        and str(r.get("snapshot_date", "")) in snapshot_dates
+    ]
+
+    # Latest status per (ticker, option_type) — log is append-only so pick most recent
     seen, latest = set(), []
     for r in sorted(step1_rows,
                     key=lambda r: r.get("submitted_at") or "", reverse=True):
@@ -929,7 +937,7 @@ def main():
         return
 
     st.caption(f"{len(trades)} trade(s) loaded for snapshot date: {trades[0].get('snapshot_date', 'N/A')}")
-    render_investment_summary(log_rows)
+    render_investment_summary(log_rows, trades)
     st.markdown("---")
 
     render_table_header()
