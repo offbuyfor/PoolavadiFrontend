@@ -670,27 +670,45 @@ def render_investment_summary(log_rows: list[dict], trades: list[dict]):
     cancelled = [r for r in latest if r.get("status") == "cancelled_by_user"]
     rejected  = [r for r in latest if r.get("status") in ("rejected", "failed")]
 
-    # Actual capital deployed: fill_avg_price (per share) × 100 shares per contract
-    # qty is always 1 contract per Step 1 order — don't use filled_qty from Alpaca
-    # as it may be expressed in shares (100) causing 100x inflation.
+    # Step 2 filled rows (stock leg) — same date + ticker scope
+    all_step2 = [
+        r for r in log_rows
+        if int(r.get("step") or 0) == 2
+        and str(r.get("snapshot_date", "")) in snapshot_dates
+        and (str(r.get("ticker", "")), str(r.get("option_type", ""))) in current_tickers
+    ]
+    seen2, latest2 = set(), []
+    for r in sorted(all_step2, key=_sat, reverse=True):
+        key = (r.get("ticker"), r.get("option_type"))
+        if key not in seen2:
+            seen2.add(key)
+            latest2.append(r)
+    filled2 = [r for r in latest2 if r.get("status") == "filled"]
+
+    # Capital deployed = option cost (Step 1) + stock position value (Step 2)
+    # Option:  fill_px (premium/share) × 100 shares/contract  (1 contract per order)
+    # Stock:   fill_px (stock price)   × 100 shares
     cache_key = "investment_summary_capital"
     if cache_key not in st.session_state:
         st.session_state[cache_key] = {}
 
-    capital = 0.0
-    for r in filled:
-        oid = r.get("alpaca_order_id", "")
+    def _fetch_cost(oid: str, multiplier: int) -> float:
         if oid in st.session_state[cache_key]:
-            capital += st.session_state[cache_key][oid]
-        else:
-            try:
-                order   = alpaca_get_order(oid)
-                fill_px = float(order.get("filled_avg_price") or 0)
-                cost    = fill_px * 100   # 1 contract × 100 shares/contract
-                st.session_state[cache_key][oid] = cost
-                capital += cost
-            except Exception:
-                pass
+            return st.session_state[cache_key][oid]
+        try:
+            order   = alpaca_get_order(oid)
+            fill_px = float(order.get("filled_avg_price") or 0)
+            cost    = fill_px * multiplier
+            st.session_state[cache_key][oid] = cost
+            return cost
+        except Exception:
+            return 0.0
+
+    capital = 0.0
+    for r in filled:                          # Step 1: option premium × 100
+        capital += _fetch_cost(r.get("alpaca_order_id", ""), 100)
+    for r in filled2:                         # Step 2: stock price × 100 shares
+        capital += _fetch_cost(r.get("alpaca_order_id", ""), 100)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("🟢 Filled",    len(filled))
