@@ -345,11 +345,12 @@ def submit_step3(trade: dict, step1_avg_fill: float, step2_avg_fill: float) -> d
 # Status helpers
 # ---------------------------------------------------------------------------
 STATUS_BADGE = {
-    "pending_approval": "🟡 Pending Approval",
-    "submitted":        "🔵 Submitted",
-    "filled":           "🟢 Filled",
-    "rejected":         "🔴 Rejected",
-    "failed":           "❌ Failed",
+    "pending_approval":  "🟡 Pending Approval",
+    "submitted":         "🔵 Submitted",
+    "filled":            "🟢 Filled",
+    "rejected":          "🔴 Rejected",
+    "failed":            "❌ Failed",
+    "cancelled_by_user": "🚫 Cancelled by user",
 }
 
 
@@ -480,6 +481,36 @@ def do_approve(client, trade: dict, step: int, log_rows: list[dict]):
         st.error(f"Step {step} failed: {e}")
 
 
+def do_cancel_step1(client, trade: dict, log_rows: list[dict]):
+    """Cancel a submitted Step 1 option order and log as cancelled_by_user."""
+    ticker      = trade["ticker"]
+    option_type = trade["option_type"]
+    log_row     = get_step_status(log_rows, ticker, option_type, 1)
+    if not log_row or not log_row.get("alpaca_order_id"):
+        st.error("No Step 1 order ID found to cancel.")
+        return
+    try:
+        alpaca_cancel_order(log_row["alpaca_order_id"])
+    except Exception as e:
+        st.warning(f"Alpaca cancel returned: {e} — logging as cancelled anyway.")
+    row = {
+        "id":              str(uuid.uuid4()),
+        "snapshot_date":   str(trade["snapshot_date"]),
+        "ticker":          ticker,
+        "option_type":     option_type,
+        "step":            1,
+        "alpaca_order_id": log_row["alpaca_order_id"],
+        "status":          "cancelled_by_user",
+        "submitted_at":    datetime.now(timezone.utc).isoformat(),
+        "filled_at":       None,
+        "error_message":   None,
+    }
+    ensure_log_table(client)
+    write_log_row(client, row)
+    log_rows.append(row)
+    st.info(f"Step 1 cancelled for {ticker}.")
+
+
 def do_reject(client, trade: dict, step: int, log_rows: list[dict]):
     row_id = str(uuid.uuid4())
     row = {
@@ -590,6 +621,60 @@ def do_retry_step1(client, trade: dict, log_rows: list[dict], mode: str):
 
 
 # ---------------------------------------------------------------------------
+# Investment summary
+# ---------------------------------------------------------------------------
+
+def render_investment_summary(log_rows: list[dict]):
+    """
+    Show a summary bar: filled / pending / cancelled counts and
+    actual capital deployed fetched from Alpaca fill prices.
+    """
+    step1_rows = [r for r in log_rows if int(r.get("step", 0)) == 1]
+
+    # Latest status per ticker/option_type
+    seen, latest = set(), []
+    for r in sorted(step1_rows,
+                    key=lambda r: r.get("submitted_at") or "", reverse=True):
+        key = (r.get("ticker"), r.get("option_type"))
+        if key not in seen:
+            seen.add(key)
+            latest.append(r)
+
+    filled    = [r for r in latest if r.get("status") == "filled"]
+    submitted = [r for r in latest if r.get("status") == "submitted"]
+    cancelled = [r for r in latest if r.get("status") == "cancelled_by_user"]
+    rejected  = [r for r in latest if r.get("status") in ("rejected", "failed")]
+
+    # Actual capital deployed: fetch fill prices from Alpaca for filled orders
+    cache_key = "investment_summary_capital"
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = {}
+
+    capital = 0.0
+    for r in filled:
+        oid = r.get("alpaca_order_id", "")
+        if oid in st.session_state[cache_key]:
+            capital += st.session_state[cache_key][oid]
+        else:
+            try:
+                order    = alpaca_get_order(oid)
+                fill_px  = float(order.get("filled_avg_price") or 0)
+                qty      = int(order.get("filled_qty") or order.get("qty") or 1)
+                cost     = fill_px * qty * 100
+                st.session_state[cache_key][oid] = cost
+                capital += cost
+            except Exception:
+                pass
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("🟢 Filled",    len(filled))
+    c2.metric("🔵 Pending",   len(submitted))
+    c3.metric("🚫 Cancelled", len(cancelled))
+    c4.metric("🔴 Rejected",  len(rejected))
+    c5.metric("💰 Deployed",  f"${capital:,.0f}")
+
+
+# ---------------------------------------------------------------------------
 # UI rendering
 # ---------------------------------------------------------------------------
 VERDICT_STYLE = {
@@ -677,9 +762,30 @@ def render_step_cell(client, trade: dict, step: int, details: str, log_rows: lis
                 st.rerun()
 
     if status == "submitted" and step == 1:
-        with st.expander("Order not filling? Retry"):
-            st.caption("Cancels current order and re-submits.")
-            r1, r2 = st.columns(2)
+        # Time elapsed since submission
+        submitted_at = log_row.get("submitted_at") if log_row else None
+        if submitted_at:
+            if isinstance(submitted_at, str):
+                try:
+                    submitted_at = datetime.fromisoformat(submitted_at.replace("Z", "+00:00"))
+                except ValueError:
+                    submitted_at = None
+            if submitted_at:
+                if submitted_at.tzinfo is None:
+                    submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+                elapsed     = datetime.now(timezone.utc) - submitted_at
+                total_secs  = int(elapsed.total_seconds())
+                if total_secs < 3600:
+                    elapsed_str = f"{total_secs // 60}m {total_secs % 60}s ago"
+                else:
+                    h = total_secs // 3600
+                    m = (total_secs % 3600) // 60
+                    elapsed_str = f"{h}h {m}m ago"
+                st.caption(f"⏱ {elapsed_str}")
+
+        with st.expander("Order not filling? Retry / Cancel"):
+            st.caption("All actions cancel the current order first.")
+            r1, r2, r3 = st.columns(3)
             with r1:
                 if st.button("Retry at Ask", key=f"retry_ask_{ticker}_{option_type}",
                              use_container_width=True, help="Limit order at current ask price"):
@@ -690,6 +796,12 @@ def render_step_cell(client, trade: dict, step: int, details: str, log_rows: lis
                              use_container_width=True, type="secondary",
                              help="Last resort — fills at any price"):
                     do_retry_step1(client, trade, log_rows, mode="market")
+                    st.rerun()
+            with r3:
+                if st.button("Cancel", key=f"cancel_s1_{ticker}_{option_type}",
+                             use_container_width=True, type="secondary",
+                             help="Cancel order — logged as Cancelled by user"):
+                    do_cancel_step1(client, trade, log_rows)
                     st.rerun()
 
 
@@ -817,6 +929,7 @@ def main():
         return
 
     st.caption(f"{len(trades)} trade(s) loaded for snapshot date: {trades[0].get('snapshot_date', 'N/A')}")
+    render_investment_summary(log_rows)
     st.markdown("---")
 
     render_table_header()
