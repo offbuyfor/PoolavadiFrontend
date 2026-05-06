@@ -639,10 +639,20 @@ def render_investment_summary(log_rows: list[dict], trades: list[dict]):
         and str(r.get("snapshot_date", "")) in snapshot_dates
     ]
 
+    def _sat(r):
+        v = r.get("submitted_at")
+        if isinstance(v, datetime):
+            return v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        return datetime.min.replace(tzinfo=timezone.utc)
+
     # Latest status per (ticker, option_type) — log is append-only so pick most recent
     seen, latest = set(), []
-    for r in sorted(step1_rows,
-                    key=lambda r: r.get("submitted_at") or "", reverse=True):
+    for r in sorted(step1_rows, key=_sat, reverse=True):
         key = (r.get("ticker"), r.get("option_type"))
         if key not in seen:
             seen.add(key)
@@ -653,7 +663,9 @@ def render_investment_summary(log_rows: list[dict], trades: list[dict]):
     cancelled = [r for r in latest if r.get("status") == "cancelled_by_user"]
     rejected  = [r for r in latest if r.get("status") in ("rejected", "failed")]
 
-    # Actual capital deployed: fetch fill prices from Alpaca for filled orders
+    # Actual capital deployed: fill_avg_price (per share) × 100 shares per contract
+    # qty is always 1 contract per Step 1 order — don't use filled_qty from Alpaca
+    # as it may be expressed in shares (100) causing 100x inflation.
     cache_key = "investment_summary_capital"
     if cache_key not in st.session_state:
         st.session_state[cache_key] = {}
@@ -665,10 +677,9 @@ def render_investment_summary(log_rows: list[dict], trades: list[dict]):
             capital += st.session_state[cache_key][oid]
         else:
             try:
-                order    = alpaca_get_order(oid)
-                fill_px  = float(order.get("filled_avg_price") or 0)
-                qty      = int(order.get("filled_qty") or order.get("qty") or 1)
-                cost     = fill_px * qty * 100
+                order   = alpaca_get_order(oid)
+                fill_px = float(order.get("filled_avg_price") or 0)
+                cost    = fill_px * 100   # 1 contract × 100 shares/contract
                 st.session_state[cache_key][oid] = cost
                 capital += cost
             except Exception:
@@ -923,6 +934,7 @@ def main():
                 st.session_state.log_rows = []
 
         if refresh_clicked:
+            st.session_state.pop("investment_summary_capital", None)
             updated = refresh_all_statuses(client, st.session_state.log_rows)
             if updated:
                 st.success(f"Updated {updated} order(s) from Alpaca.")
