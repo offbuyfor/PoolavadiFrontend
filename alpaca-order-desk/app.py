@@ -630,13 +630,20 @@ def render_investment_summary(log_rows: list[dict], trades: list[dict]):
     actual capital deployed fetched from Alpaca fill prices.
     Scoped to the current snapshot date only.
     """
-    # Scope to current snapshot date from the loaded trades
-    snapshot_dates = {str(t.get("snapshot_date", "")) for t in trades}
+    # Scope strictly to tickers+option_type that are in the current loaded trades
+    # AND match the current snapshot date. Double filter prevents old filled entries
+    # for the same ticker from leaking through on repeat days.
+    snapshot_dates   = {str(t.get("snapshot_date", "")) for t in trades}
+    current_tickers  = {
+        (str(t.get("ticker", "")), str(t.get("option_type", "")))
+        for t in trades
+    }
 
     step1_rows = [
         r for r in log_rows
         if int(r.get("step") or 0) == 1
         and str(r.get("snapshot_date", "")) in snapshot_dates
+        and (str(r.get("ticker", "")), str(r.get("option_type", ""))) in current_tickers
     ]
 
     def _sat(r):
