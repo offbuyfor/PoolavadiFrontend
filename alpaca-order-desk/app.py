@@ -621,6 +621,169 @@ def do_retry_step1(client, trade: dict, log_rows: list[dict], mode: str):
 
 
 # ---------------------------------------------------------------------------
+# Close all positions
+# ---------------------------------------------------------------------------
+
+def get_stock_quote(ticker: str) -> tuple[float, float]:
+    """Return (bid, ask) for a stock. Returns (0, 0) on failure."""
+    try:
+        url  = f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/quotes/latest"
+        resp = requests.get(url, headers=ALPACA_HEADERS, timeout=10)
+        resp.raise_for_status()
+        q = resp.json().get("quote", {})
+        return float(q.get("bp", 0) or 0), float(q.get("ap", 0) or 0)
+    except Exception:
+        return 0.0, 0.0
+
+
+def get_active_positions(log_rows: list[dict], trades: list[dict],
+                          snapshot_dates: set, current_tickers: set) -> list[dict]:
+    """
+    Return positions where Step 1 is filled (with or without Step 2).
+    Each entry includes the matched trade dict for symbol reconstruction.
+    """
+    trade_map = {
+        (str(t.get("ticker", "")), str(t.get("option_type", ""))): t
+        for t in trades
+    }
+
+    def latest_for_step(step: int) -> dict:
+        rows = [
+            r for r in log_rows
+            if int(r.get("step") or 0) == step
+            and str(r.get("snapshot_date", "")) in snapshot_dates
+            and (str(r.get("ticker", "")), str(r.get("option_type", ""))) in current_tickers
+        ]
+        result = {}
+        for r in sorted(rows, key=lambda r: str(r.get("submitted_at") or ""), reverse=True):
+            key = (str(r.get("ticker", "")), str(r.get("option_type", "")))
+            if key not in result:
+                result[key] = r
+        return result
+
+    s1_latest = latest_for_step(1)
+    s2_latest = latest_for_step(2)
+    s3_latest = latest_for_step(3)
+
+    positions = []
+    for key, s1_row in s1_latest.items():
+        if s1_row.get("status") != "filled":
+            continue
+        trade    = trade_map.get(key, {})
+        s2_row   = s2_latest.get(key)
+        s3_row   = s3_latest.get(key)
+        has_stock = s2_row is not None and s2_row.get("status") == "filled"
+        s3_open   = (s3_row is not None
+                     and s3_row.get("status") == "submitted"
+                     and s3_row.get("alpaca_order_id"))
+        positions.append({
+            "ticker":       key[0],
+            "option_type":  key[1],
+            "trade":        trade,
+            "s1_order_id":  s1_row.get("alpaca_order_id"),
+            "s2_order_id":  s2_row.get("alpaca_order_id") if s2_row else None,
+            "s3_order_id":  s3_row.get("alpaca_order_id") if s3_open else None,
+            "has_stock":    has_stock,
+        })
+    return positions
+
+
+def do_close_all_positions(client, positions: list[dict],
+                            log_rows: list[dict]) -> list[dict]:
+    """
+    For each position:
+      1. Cancel Step 3 closing limit (if open)
+      2. Close stock leg: limit at ask (buy to cover CALL) or bid (sell PUT)
+      3. Close option leg: limit at midpoint
+    Logs each action and returns a results list.
+    """
+    results = []
+
+    for pos in positions:
+        ticker      = pos["ticker"]
+        option_type = pos["option_type"]
+        trade       = pos["trade"]
+        result      = {"ticker": ticker, "option_type": option_type,
+                       "steps": [], "errors": []}
+
+        base_log = {
+            "snapshot_date": str(trade.get("snapshot_date", "")),
+            "ticker":        ticker,
+            "option_type":   option_type,
+            "submitted_at":  datetime.now(timezone.utc).isoformat(),
+            "filled_at":     None,
+            "error_message": None,
+        }
+
+        # ── Step A: cancel Step 3 limit ──────────────────────────────────────
+        if pos["s3_order_id"]:
+            try:
+                alpaca_cancel_order(pos["s3_order_id"])
+                result["steps"].append("Step 3 limit cancelled")
+            except Exception as e:
+                result["errors"].append(f"Cancel Step 3: {e}")
+
+        # ── Step B: close stock leg ───────────────────────────────────────────
+        if pos["has_stock"]:
+            try:
+                bid, ask = get_stock_quote(ticker)
+                is_call  = option_type.lower() == "call"
+                # CALL = short stock → buy to cover at ask
+                # PUT  = long stock  → sell at bid
+                close_side  = "buy" if is_call else "sell"
+                close_price = ask if is_call else bid
+                if close_price <= 0:
+                    raise ValueError(f"No live quote for {ticker}")
+
+                payload = {
+                    "symbol":        ticker.upper(),
+                    "qty":           "100",
+                    "side":          close_side,
+                    "type":          "limit",
+                    "limit_price":   str(round(close_price, 2)),
+                    "time_in_force": "day",
+                }
+                resp = alpaca_post("/v2/orders", payload)
+                row  = {**base_log, "id": str(uuid.uuid4()), "step": 4,
+                        "alpaca_order_id": resp.get("id", ""), "status": "submitted"}
+                ensure_log_table(client)
+                write_log_row(client, row)
+                log_rows.append(row)
+                result["steps"].append(f"Stock close submitted @ ${close_price:.2f}")
+            except Exception as e:
+                result["errors"].append(f"Close stock: {e}")
+
+        # ── Step C: close option leg ──────────────────────────────────────────
+        try:
+            opt_symbol  = build_option_symbol(
+                ticker, trade.get("Option_Expiry_Date"),
+                option_type, trade.get("calls_strike", 0),
+            )
+            mid = get_option_midpoint(opt_symbol, trade.get("options_price", 1.00))
+            payload = {
+                "symbol":        opt_symbol,
+                "qty":           "1",
+                "side":          "sell",
+                "type":          "limit",
+                "limit_price":   str(mid),
+                "time_in_force": "day",
+                "asset_class":   "option",
+            }
+            resp = alpaca_post("/v2/orders", payload)
+            row  = {**base_log, "id": str(uuid.uuid4()), "step": 5,
+                    "alpaca_order_id": resp.get("id", ""), "status": "submitted"}
+            ensure_log_table(client)
+            write_log_row(client, row)
+            log_rows.append(row)
+            result["steps"].append(f"Option close submitted @ ${mid:.2f} (mid)")
+        except Exception as e:
+            result["errors"].append(f"Close option: {e}")
+
+        results.append(result)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Investment summary
 # ---------------------------------------------------------------------------
 
@@ -933,13 +1096,17 @@ def main():
 
     # Session state init
     if "trades" not in st.session_state:
-        st.session_state.trades   = None
-        st.session_state.log_rows = None
+        st.session_state.trades        = None
+        st.session_state.log_rows      = None
+        st.session_state.show_close_confirm = False
 
     # Top bar
-    col_title, col_btn = st.columns([8, 2])
-    with col_btn:
+    col_title, col_refresh, col_close = st.columns([6, 2, 2])
+    with col_refresh:
         refresh_clicked = st.button("🔄 Refresh Status", use_container_width=True)
+    with col_close:
+        if st.button("🔴 Close All Positions", use_container_width=True):
+            st.session_state.show_close_confirm = True
 
     # Load / refresh data
     if st.session_state.trades is None or refresh_clicked:
@@ -976,6 +1143,41 @@ def main():
     st.caption(f"{len(trades)} trade(s) loaded for snapshot date: {trades[0].get('snapshot_date', 'N/A')}")
     render_investment_summary(log_rows, trades)
     st.markdown("---")
+
+    # Close All Positions confirmation panel
+    if st.session_state.get("show_close_confirm"):
+        snapshot_dates  = {str(t.get("snapshot_date", "")) for t in trades}
+        current_tickers = {(str(t.get("ticker", "")), str(t.get("option_type", ""))) for t in trades}
+        positions = get_active_positions(log_rows, trades, snapshot_dates, current_tickers)
+
+        if not positions:
+            st.warning("No filled positions found to close.")
+            st.session_state.show_close_confirm = False
+        else:
+            st.error("**Confirm: Close All Positions**")
+            for p in positions:
+                legs = "Option + Stock" if p["has_stock"] else "Option only"
+                st.write(f"• **{p['ticker']}** {p['option_type'].upper()}  —  {legs}"
+                         + ("  _(Step 3 limit will be cancelled first)_" if p["s3_order_id"] else ""))
+            st.caption("Stock leg closes first (limit at bid/ask), then option (limit at midpoint).")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Confirm — Close All", type="primary", use_container_width=True):
+                    with st.spinner("Closing positions…"):
+                        results = do_close_all_positions(client, positions, log_rows)
+                    for r in results:
+                        if r["errors"]:
+                            st.error(f"{r['ticker']} {r['option_type'].upper()}: "
+                                     + " | ".join(r["errors"]))
+                        else:
+                            st.success(f"{r['ticker']} {r['option_type'].upper()}: "
+                                       + " → ".join(r["steps"]))
+                    st.session_state.show_close_confirm = False
+                    st.session_state.pop("investment_summary_capital", None)
+            with c2:
+                if st.button("Cancel", use_container_width=True):
+                    st.session_state.show_close_confirm = False
+                    st.rerun()
 
     render_table_header()
     for trade in trades:
