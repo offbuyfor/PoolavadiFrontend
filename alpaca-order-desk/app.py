@@ -18,21 +18,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Config & credential validation
+# Config
 # ---------------------------------------------------------------------------
-ALPACA_API_KEY        = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY     = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL       = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-GCP_PROJECT_ID        = os.getenv("GCP_PROJECT_ID", "")
-BQ_DATASET            = os.getenv("BQ_DATASET", "FOR_EXTERNAL")
-BQ_SOURCE_TABLE       = os.getenv("BQ_SOURCE_TABLE", "final_portfolio_optimization_paper")
-BQ_LOG_TABLE          = os.getenv("BQ_LOG_TABLE", "order_execution_log")
-GOOGLE_CREDS          = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./service-account.json")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+GCP_PROJECT_ID  = os.getenv("GCP_PROJECT_ID", "")
+BQ_DATASET      = os.getenv("BQ_DATASET", "FOR_EXTERNAL")
+BQ_SOURCE_TABLE = os.getenv("BQ_SOURCE_TABLE", "final_portfolio_optimization_paper")
+BQ_LOG_TABLE    = os.getenv("BQ_LOG_TABLE", "order_execution_log")
+GOOGLE_CREDS    = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./service-account.json")
 
-MISSING_CREDS = []
-if not ALPACA_API_KEY:    MISSING_CREDS.append("ALPACA_API_KEY")
-if not ALPACA_SECRET_KEY: MISSING_CREDS.append("ALPACA_SECRET_KEY")
-if not GCP_PROJECT_ID:    MISSING_CREDS.append("GCP_PROJECT_ID")
+ACCOUNTS = {
+    "paper95k": {
+        "label":       "Paper 95K",
+        "budget":      95_000,
+        "api_key_env": "ALPACA_95K_API_KEY",
+        "secret_env":  "ALPACA_95K_SECRET_KEY",
+    },
+    "paper9k": {
+        "label":       "Paper 9K",
+        "budget":       9_000,
+        "api_key_env": "ALPACA_PAPER9K_API_KEY",
+        "secret_env":  "ALPACA_PAPER9K_SECRET_KEY",
+    },
+}
+
+MISSING_CREDS = [] if GCP_PROJECT_ID else ["GCP_PROJECT_ID"]
+
 
 # ---------------------------------------------------------------------------
 # BigQuery helpers
@@ -56,16 +67,21 @@ def ensure_log_table(client):
         bigquery.SchemaField("submitted_at",    "TIMESTAMP"),
         bigquery.SchemaField("filled_at",       "TIMESTAMP"),
         bigquery.SchemaField("error_message",   "STRING"),
+        bigquery.SchemaField("account_id",      "STRING"),
     ]
     try:
-        client.get_table(table_ref)
+        table = client.get_table(table_ref)
+        existing_names = {f.name for f in table.schema}
+        if "account_id" not in existing_names:
+            table.schema = list(table.schema) + [
+                bigquery.SchemaField("account_id", "STRING")
+            ]
+            client.update_table(table, ["schema"])
     except Exception:
-        table = bigquery.Table(table_ref, schema=schema)
-        client.create_table(table)
+        client.create_table(bigquery.Table(table_ref, schema=schema))
 
 
 def fetch_trades(client) -> list[dict]:
-    """Read pending trades from BigQuery source table."""
     query = f"""
         SELECT
             option_type,
@@ -92,11 +108,11 @@ def fetch_trades(client) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def fetch_log(client) -> list[dict]:
-    """Read all log rows for trades in the current session."""
+def fetch_log(client, account_id: str) -> list[dict]:
     query = f"""
         SELECT *
         FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_LOG_TABLE}`
+        WHERE account_id = '{account_id}'
         ORDER BY submitted_at DESC
     """
     try:
@@ -117,9 +133,8 @@ def write_log_row(client, row: dict):
     if errors:
         raise RuntimeError(f"BQ insert errors: {errors}")
 
-    
+
 def append_status_row(client, original_row: dict, updates: dict):
-    """Append a new status row instead of updating (avoids streaming buffer DML error)."""
     new_row = {**original_row, **updates, "id": str(uuid.uuid4())}
     write_log_row(client, new_row)
 
@@ -129,38 +144,43 @@ def append_status_row(client, original_row: dict, updates: dict):
 # ---------------------------------------------------------------------------
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 
-ALPACA_HEADERS = {
-    "APCA-API-KEY-ID":     ALPACA_API_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-    "Content-Type":        "application/json",
-}
+
+def _selected_account() -> str:
+    return st.session_state.get("selected_account", "paper95k")
+
+
+def _acct_headers() -> dict:
+    cfg = ACCOUNTS[_selected_account()]
+    return {
+        "APCA-API-KEY-ID":     os.getenv(cfg["api_key_env"], ""),
+        "APCA-API-SECRET-KEY": os.getenv(cfg["secret_env"], ""),
+        "Content-Type":        "application/json",
+    }
 
 
 def alpaca_post(endpoint: str, payload: dict) -> dict:
-    url = f"{ALPACA_BASE_URL}{endpoint}"
-    resp = requests.post(url, json=payload, headers=ALPACA_HEADERS, timeout=10)
+    url  = f"{ALPACA_BASE_URL}{endpoint}"
+    resp = requests.post(url, json=payload, headers=_acct_headers(), timeout=10)
     if not resp.ok:
         raise RuntimeError(f"{resp.status_code} {resp.reason}: {resp.text} | Payload: {payload}")
     return resp.json()
 
 
 def alpaca_get_order(order_id: str) -> dict:
-    url = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
-    resp = requests.get(url, headers=ALPACA_HEADERS, timeout=10)
+    url  = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
+    resp = requests.get(url, headers=_acct_headers(), timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 
 def alpaca_cancel_order(order_id: str) -> None:
-    url = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
-    resp = requests.delete(url, headers=ALPACA_HEADERS, timeout=10)
-    # 204 = cancelled, 422 = already filled/cancelled — both are acceptable
+    url  = f"{ALPACA_BASE_URL}/v2/orders/{order_id}"
+    resp = requests.delete(url, headers=_acct_headers(), timeout=10)
     if resp.status_code not in (204, 422):
         resp.raise_for_status()
 
 
 def build_option_symbol(ticker: str, expiry, option_type: str, strike: float) -> str:
-    """OCC symbol: TICKER + YYMMDD + C/P + strike*1000 zero-padded to 8 digits."""
     if hasattr(expiry, "strftime"):
         exp_str = expiry.strftime("%y%m%d")
     else:
@@ -171,37 +191,29 @@ def build_option_symbol(ticker: str, expiry, option_type: str, strike: float) ->
 
 
 def get_option_midpoint(symbol: str, fallback_price: float) -> float:
-    """Fetch latest bid/ask for an option and return the midpoint.
-    Falls back to fallback_price if the quote is unavailable."""
     try:
         url  = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
         resp = requests.get(url, params={"symbols": symbol},
-                            headers=ALPACA_HEADERS, timeout=10)
+                            headers=_acct_headers(), timeout=10)
         resp.raise_for_status()
-        data  = resp.json()
-        quote = data.get("quotes", {}).get(symbol, {})
+        quote = resp.json().get("quotes", {}).get(symbol, {})
         bid   = float(quote.get("bp", 0) or 0)
         ask   = float(quote.get("ap", 0) or 0)
         if bid > 0 and ask > 0:
-            mid = round((bid + ask) / 2, 2)
-            return max(mid, 0.01)
+            return max(round((bid + ask) / 2, 2), 0.01)
     except Exception:
         pass
     return round(float(fallback_price), 2)
 
 
 LIQUIDITY_THRESHOLDS = {
-    "spread_pct": {"green": 5.0,  "yellow": 15.0},   # % of midpoint
-    "open_interest": {"green": 1000, "yellow": 500},  # contracts
-    "volume":        {"green": 100,  "yellow": 50},   # contracts today
+    "spread_pct":    {"green": 5.0,  "yellow": 15.0},
+    "open_interest": {"green": 1000, "yellow": 500},
+    "volume":        {"green": 100,  "yellow": 50},
 }
 
 
 def get_option_liquidity(symbol: str, oi, volume) -> dict:
-    """
-    Fetch live bid/ask, open interest, and volume from Alpaca snapshots endpoint.
-    Falls back to BQ values for OI/volume if the snapshot is unavailable.
-    """
     result = {
         "bid": None, "ask": None, "mid": None, "spread_pct": None,
         "open_interest": int(oi or 0),
@@ -213,11 +225,10 @@ def get_option_liquidity(symbol: str, oi, volume) -> dict:
     try:
         url  = f"{ALPACA_DATA_URL}/v1beta1/options/snapshots"
         resp = requests.get(url, params={"symbols": symbol},
-                            headers=ALPACA_HEADERS, timeout=10)
+                            headers=_acct_headers(), timeout=10)
         resp.raise_for_status()
         snap = resp.json().get("snapshots", {}).get(symbol, {})
 
-        # Bid / ask from latestQuote
         quote = snap.get("latestQuote", {})
         bid   = float(quote.get("bp", 0) or 0)
         ask   = float(quote.get("ap", 0) or 0)
@@ -228,14 +239,11 @@ def get_option_liquidity(symbol: str, oi, volume) -> dict:
             result["mid"]        = round(mid, 2)
             result["spread_pct"] = round((ask - bid) / mid * 100, 1)
 
-        # Live open interest from snapshot (overrides BQ value)
         live_oi = snap.get("openInterest") or snap.get("open_interest")
         if live_oi is not None:
             result["open_interest"] = int(live_oi)
 
-        # Live volume from snapshot daily bar if available
-        daily_bar = snap.get("dailyBar", {})
-        live_vol  = daily_bar.get("v")
+        live_vol = snap.get("dailyBar", {}).get("v")
         if live_vol is not None:
             result["volume"] = int(live_vol)
 
@@ -248,37 +256,53 @@ def get_option_liquidity(symbol: str, oi, volume) -> dict:
         t = LIQUIDITY_THRESHOLDS[key]
         if key == "spread_pct":
             return "green" if value <= t["green"] else ("yellow" if value <= t["yellow"] else "red")
-        else:
-            return "green" if value >= t["green"] else ("yellow" if value >= t["yellow"] else "red")
+        return "green" if value >= t["green"] else ("yellow" if value >= t["yellow"] else "red")
 
     result["ratings"]["spread_pct"]    = rate("spread_pct",    result["spread_pct"])
     result["ratings"]["open_interest"] = rate("open_interest", result["open_interest"])
     result["ratings"]["volume"]        = rate("volume",        result["volume"])
 
     ratings = list(result["ratings"].values())
-    if "red" in ratings:
-        result["verdict"] = "ILLIQUID"
-    elif "yellow" in ratings:
-        result["verdict"] = "CAUTION"
-    elif "grey" in ratings:
-        result["verdict"] = "UNKNOWN"
-    else:
-        result["verdict"] = "LIQUID"
+    if "red" in ratings:       result["verdict"] = "ILLIQUID"
+    elif "yellow" in ratings:  result["verdict"] = "CAUTION"
+    elif "grey" in ratings:    result["verdict"] = "UNKNOWN"
+    else:                      result["verdict"] = "LIQUID"
 
     return result
 
 
+def get_option_ask(symbol: str, fallback_price: float) -> float:
+    try:
+        url  = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
+        resp = requests.get(url, params={"symbols": symbol},
+                            headers=_acct_headers(), timeout=10)
+        resp.raise_for_status()
+        ask = float(resp.json().get("quotes", {}).get(symbol, {}).get("ap", 0) or 0)
+        if ask > 0:
+            return round(ask, 2)
+    except Exception:
+        pass
+    return round(float(fallback_price), 2)
+
+
+def get_stock_quote(ticker: str) -> tuple[float, float]:
+    try:
+        url  = f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/quotes/latest"
+        resp = requests.get(url, headers=_acct_headers(), timeout=10)
+        resp.raise_for_status()
+        q = resp.json().get("quote", {})
+        return float(q.get("bp", 0) or 0), float(q.get("ap", 0) or 0)
+    except Exception:
+        return 0.0, 0.0
+
+
 def submit_step1(trade: dict) -> dict:
-    """Buy option contract at limit = midpoint of current bid/ask.
-    Falls back to the quoted premium from BQ if the quote is unavailable."""
     symbol = build_option_symbol(
-        trade["ticker"],
-        trade["Option_Expiry_Date"],
-        trade["option_type"],
-        trade["calls_strike"],
+        trade["ticker"], trade["Option_Expiry_Date"],
+        trade["option_type"], trade["calls_strike"],
     )
     limit_price = get_option_midpoint(symbol, trade.get("options_price", 1.00))
-    payload = {
+    return alpaca_post("/v2/orders", {
         "symbol":        symbol,
         "qty":           "1",
         "side":          "buy",
@@ -286,25 +310,21 @@ def submit_step1(trade: dict) -> dict:
         "limit_price":   str(limit_price),
         "time_in_force": "day",
         "asset_class":   "option",
-    }
-    return alpaca_post("/v2/orders", payload)
+    })
 
 
 def submit_step2(trade: dict) -> dict:
-    """Married position: sell 100 shares (call) or buy 100 shares (put)."""
     is_call = trade["option_type"].lower() == "call"
-    payload = {
+    return alpaca_post("/v2/orders", {
         "symbol":        trade["ticker"].upper(),
         "qty":           "100",
         "side":          "sell" if is_call else "buy",
         "type":          "market",
         "time_in_force": "day",
-    }
-    return alpaca_post("/v2/orders", payload)
+    })
 
 
 def _use_extended_hours(trade: dict) -> bool:
-    """Extended hours = True unless earnings are today PM or tomorrow AM."""
     from datetime import date, timedelta
     raw = trade.get("Earnings_Date")
     if raw is None:
@@ -313,32 +333,22 @@ def _use_extended_hours(trade: dict) -> bool:
         earnings = raw if isinstance(raw, date) else datetime.strptime(str(raw), "%Y-%m-%d").date()
     except (ValueError, TypeError):
         return True
-    today    = date.today()
-    tomorrow = today + timedelta(days=1)
-    return earnings not in (today, tomorrow)
+    today = date.today()
+    return earnings not in (today, today + timedelta(days=1))
 
 
 def submit_step3(trade: dict, step1_avg_fill: float, step2_avg_fill: float) -> dict:
-    """Closing order using actual fill prices.
-    CALL: buy @ step2_avg_stock - step1_avg_option  (recover option cost from stock gain)
-    PUT:  sell @ step2_avg_stock + step1_avg_option (recover option cost from stock sale)
-    Extended hours disabled when earnings are today PM or tomorrow AM.
-    """
-    is_call = trade["option_type"].lower() == "call"
-    if is_call:
-        limit_price = round(step2_avg_fill - step1_avg_fill, 2)
-    else:
-        limit_price = round(step2_avg_fill + step1_avg_fill, 2)
-    payload = {
-        "symbol":          trade["ticker"].upper(),
-        "qty":             "100",
-        "side":            "buy" if is_call else "sell",
-        "type":            "limit",
-        "limit_price":     str(limit_price),
-        "time_in_force":   "gtc",
-        "extended_hours":  _use_extended_hours(trade),
-    }
-    return alpaca_post("/v2/orders", payload)
+    is_call     = trade["option_type"].lower() == "call"
+    limit_price = round(step2_avg_fill - step1_avg_fill if is_call else step2_avg_fill + step1_avg_fill, 2)
+    return alpaca_post("/v2/orders", {
+        "symbol":         trade["ticker"].upper(),
+        "qty":            "100",
+        "side":           "buy" if is_call else "sell",
+        "type":           "limit",
+        "limit_price":    str(limit_price),
+        "time_in_force":  "gtc",
+        "extended_hours": _use_extended_hours(trade),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +365,6 @@ STATUS_BADGE = {
 
 
 def get_step_status(log_rows: list[dict], ticker: str, option_type: str, step: int):
-    """Return the most-recent log row for this ticker/option_type/step, or None."""
     matches = [
         r for r in log_rows
         if r["ticker"] == ticker
@@ -364,7 +373,7 @@ def get_step_status(log_rows: list[dict], ticker: str, option_type: str, step: i
     ]
     if not matches:
         return None
-    # Sort by submitted_at descending, handle None
+
     def _sort_key(r):
         v = r.get("submitted_at")
         if isinstance(v, datetime):
@@ -381,13 +390,11 @@ def get_step_status(log_rows: list[dict], ticker: str, option_type: str, step: i
 
 
 # ---------------------------------------------------------------------------
-# Refresh: poll Alpaca for fill status and update BQ
+# Refresh
 # ---------------------------------------------------------------------------
 def refresh_all_statuses(client, log_rows: list[dict]) -> int:
     updated = 0
-    # Build set of latest row per (ticker, option_type, step) — only poll if latest is still "submitted"
-    seen = set()
-    rows_to_poll = []
+    seen, rows_to_poll = set(), []
     for row in sorted(log_rows, key=lambda r: r.get("submitted_at") or "", reverse=True):
         key = (row.get("ticker"), row.get("option_type"), row.get("step"))
         if key in seen:
@@ -401,10 +408,10 @@ def refresh_all_statuses(client, log_rows: list[dict]) -> int:
         if not order_id:
             continue
         try:
-            order = alpaca_get_order(order_id)
+            order         = alpaca_get_order(order_id)
             alpaca_status = order.get("status", "")
-            new_status = None
-            filled_at  = None
+            new_status    = None
+            filled_at     = None
             if alpaca_status in ("filled", "partially_filled"):
                 new_status = "filled"
                 raw_filled = order.get("filled_at")
@@ -424,7 +431,6 @@ def refresh_all_statuses(client, log_rows: list[dict]) -> int:
                 updated += 1
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                # Order belongs to a previous account — skip silently
                 pass
             else:
                 st.warning(f"Alpaca poll error for order {order_id}: {e}")
@@ -434,12 +440,11 @@ def refresh_all_statuses(client, log_rows: list[dict]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Approve / Reject actions
+# Actions
 # ---------------------------------------------------------------------------
-def do_approve(client, trade: dict, step: int, log_rows: list[dict]):
-    row_id = str(uuid.uuid4())
-    base = {
-        "id":           row_id,
+def _base_log_row(trade: dict, step: int) -> dict:
+    return {
+        "id":            str(uuid.uuid4()),
         "snapshot_date": str(trade["snapshot_date"]),
         "ticker":        trade["ticker"],
         "option_type":   trade["option_type"],
@@ -447,20 +452,24 @@ def do_approve(client, trade: dict, step: int, log_rows: list[dict]):
         "submitted_at":  datetime.now(timezone.utc).isoformat(),
         "filled_at":     None,
         "error_message": None,
+        "account_id":    _selected_account(),
     }
+
+
+def do_approve(client, trade: dict, step: int, log_rows: list[dict]):
+    base = _base_log_row(trade, step)
     try:
         if step == 1:
             resp = submit_step1(trade)
         elif step == 2:
             resp = submit_step2(trade)
         else:
-            # Fetch actual avg fill prices from Alpaca for Steps 1 & 2
             s1_row = get_step_status(log_rows, trade["ticker"], trade["option_type"], 1)
             s2_row = get_step_status(log_rows, trade["ticker"], trade["option_type"], 2)
             if not s1_row or not s2_row:
                 raise RuntimeError("Cannot find Step 1 or Step 2 log entries.")
-            s1_order = alpaca_get_order(s1_row["alpaca_order_id"])
-            s2_order = alpaca_get_order(s2_row["alpaca_order_id"])
+            s1_order  = alpaca_get_order(s1_row["alpaca_order_id"])
+            s2_order  = alpaca_get_order(s2_row["alpaca_order_id"])
             step1_avg = float(s1_order.get("filled_avg_price") or s1_order.get("limit_price") or trade["options_price"])
             step2_avg = float(s2_order.get("filled_avg_price") or s2_order.get("limit_price") or trade["Close_Price"])
             resp = submit_step3(trade, step1_avg, step2_avg)
@@ -482,7 +491,6 @@ def do_approve(client, trade: dict, step: int, log_rows: list[dict]):
 
 
 def do_cancel_step1(client, trade: dict, log_rows: list[dict]):
-    """Cancel a submitted Step 1 option order and log as cancelled_by_user."""
     ticker      = trade["ticker"]
     option_type = trade["option_type"]
     log_row     = get_step_status(log_rows, ticker, option_type, 1)
@@ -494,16 +502,9 @@ def do_cancel_step1(client, trade: dict, log_rows: list[dict]):
     except Exception as e:
         st.warning(f"Alpaca cancel returned: {e} — logging as cancelled anyway.")
     row = {
-        "id":              str(uuid.uuid4()),
-        "snapshot_date":   str(trade["snapshot_date"]),
-        "ticker":          ticker,
-        "option_type":     option_type,
-        "step":            1,
+        **_base_log_row(trade, 1),
         "alpaca_order_id": log_row["alpaca_order_id"],
         "status":          "cancelled_by_user",
-        "submitted_at":    datetime.now(timezone.utc).isoformat(),
-        "filled_at":       None,
-        "error_message":   None,
     }
     ensure_log_table(client)
     write_log_row(client, row)
@@ -512,49 +513,14 @@ def do_cancel_step1(client, trade: dict, log_rows: list[dict]):
 
 
 def do_reject(client, trade: dict, step: int, log_rows: list[dict]):
-    row_id = str(uuid.uuid4())
-    row = {
-        "id":            row_id,
-        "snapshot_date": str(trade["snapshot_date"]),
-        "ticker":        trade["ticker"],
-        "option_type":   trade["option_type"],
-        "step":          step,
-        "alpaca_order_id": None,
-        "status":        "rejected",
-        "submitted_at":  datetime.now(timezone.utc).isoformat(),
-        "filled_at":     None,
-        "error_message": None,
-    }
+    row = {**_base_log_row(trade, step), "alpaca_order_id": None, "status": "rejected"}
     ensure_log_table(client)
     write_log_row(client, row)
     log_rows.append(row)
     st.info(f"Step {step} rejected.")
 
 
-# ---------------------------------------------------------------------------
-# Step 1 retry helpers
-# ---------------------------------------------------------------------------
-
-def get_option_ask(symbol: str, fallback_price: float) -> float:
-    """Return the current ask price, falling back to fallback_price."""
-    try:
-        url  = f"{ALPACA_DATA_URL}/v1beta1/options/quotes/latest"
-        resp = requests.get(url, params={"symbols": symbol},
-                            headers=ALPACA_HEADERS, timeout=10)
-        resp.raise_for_status()
-        ask = float(resp.json().get("quotes", {}).get(symbol, {}).get("ap", 0) or 0)
-        if ask > 0:
-            return round(ask, 2)
-    except Exception:
-        pass
-    return round(float(fallback_price), 2)
-
-
 def do_retry_step1(client, trade: dict, log_rows: list[dict], mode: str):
-    """
-    Cancel the current Step 1 order and re-submit.
-    mode: 'ask' → limit at current ask  |  'market' → market order
-    """
     ticker      = trade["ticker"]
     option_type = trade["option_type"]
     log_row     = get_step_status(log_rows, ticker, option_type, 1)
@@ -562,44 +528,19 @@ def do_retry_step1(client, trade: dict, log_rows: list[dict], mode: str):
         st.error("No Step 1 order found to cancel.")
         return
 
-    old_order_id = log_row["alpaca_order_id"]
-    symbol = build_option_symbol(
-        ticker, trade["Option_Expiry_Date"], option_type, trade["calls_strike"],
-    )
-    base = {
-        "id":            str(uuid.uuid4()),
-        "snapshot_date": str(trade["snapshot_date"]),
-        "ticker":        ticker,
-        "option_type":   option_type,
-        "step":          1,
-        "submitted_at":  datetime.now(timezone.utc).isoformat(),
-        "filled_at":     None,
-        "error_message": None,
-    }
+    symbol = build_option_symbol(ticker, trade["Option_Expiry_Date"], option_type, trade["calls_strike"])
+    base   = _base_log_row(trade, 1)
     try:
-        alpaca_cancel_order(old_order_id)
+        alpaca_cancel_order(log_row["alpaca_order_id"])
 
         if mode == "ask":
             ask_price = get_option_ask(symbol, trade.get("options_price", 1.00))
-            payload = {
-                "symbol":        symbol,
-                "qty":           "1",
-                "side":          "buy",
-                "type":          "limit",
-                "limit_price":   str(ask_price),
-                "time_in_force": "day",
-                "asset_class":   "option",
-            }
+            payload   = {"symbol": symbol, "qty": "1", "side": "buy", "type": "limit",
+                         "limit_price": str(ask_price), "time_in_force": "day", "asset_class": "option"}
             label = f"limit at ask ${ask_price}"
         else:
-            payload = {
-                "symbol":        symbol,
-                "qty":           "1",
-                "side":          "buy",
-                "type":          "market",
-                "time_in_force": "day",
-                "asset_class":   "option",
-            }
+            payload = {"symbol": symbol, "qty": "1", "side": "buy", "type": "market",
+                       "time_in_force": "day", "asset_class": "option"}
             label = "market order"
 
         resp = alpaca_post("/v2/orders", payload)
@@ -608,7 +549,6 @@ def do_retry_step1(client, trade: dict, log_rows: list[dict], mode: str):
         write_log_row(client, row)
         log_rows.append(row)
         st.success(f"Retried Step 1 as {label} — new order ID: {resp.get('id')}")
-
     except Exception as e:
         row = {**base, "alpaca_order_id": None, "status": "failed", "error_message": str(e)}
         ensure_log_table(client)
@@ -623,31 +563,10 @@ def do_retry_step1(client, trade: dict, log_rows: list[dict], mode: str):
 # ---------------------------------------------------------------------------
 # Close all positions
 # ---------------------------------------------------------------------------
+def get_active_positions(log_rows, trades, snapshot_dates, current_tickers):
+    trade_map = {(str(t.get("ticker", "")), str(t.get("option_type", ""))): t for t in trades}
 
-def get_stock_quote(ticker: str) -> tuple[float, float]:
-    """Return (bid, ask) for a stock. Returns (0, 0) on failure."""
-    try:
-        url  = f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/quotes/latest"
-        resp = requests.get(url, headers=ALPACA_HEADERS, timeout=10)
-        resp.raise_for_status()
-        q = resp.json().get("quote", {})
-        return float(q.get("bp", 0) or 0), float(q.get("ap", 0) or 0)
-    except Exception:
-        return 0.0, 0.0
-
-
-def get_active_positions(log_rows: list[dict], trades: list[dict],
-                          snapshot_dates: set, current_tickers: set) -> list[dict]:
-    """
-    Return positions where Step 1 is filled (with or without Step 2).
-    Each entry includes the matched trade dict for symbol reconstruction.
-    """
-    trade_map = {
-        (str(t.get("ticker", "")), str(t.get("option_type", ""))): t
-        for t in trades
-    }
-
-    def latest_for_step(step: int) -> dict:
+    def latest_for_step(step):
         rows = [
             r for r in log_rows
             if int(r.get("step") or 0) == step
@@ -669,53 +588,31 @@ def get_active_positions(log_rows: list[dict], trades: list[dict],
     for key, s1_row in s1_latest.items():
         if s1_row.get("status") != "filled":
             continue
-        trade    = trade_map.get(key, {})
-        s2_row   = s2_latest.get(key)
-        s3_row   = s3_latest.get(key)
+        s2_row    = s2_latest.get(key)
+        s3_row    = s3_latest.get(key)
         has_stock = s2_row is not None and s2_row.get("status") == "filled"
-        s3_open   = (s3_row is not None
-                     and s3_row.get("status") == "submitted"
-                     and s3_row.get("alpaca_order_id"))
+        s3_open   = s3_row is not None and s3_row.get("status") == "submitted" and s3_row.get("alpaca_order_id")
         positions.append({
-            "ticker":       key[0],
-            "option_type":  key[1],
-            "trade":        trade,
-            "s1_order_id":  s1_row.get("alpaca_order_id"),
-            "s2_order_id":  s2_row.get("alpaca_order_id") if s2_row else None,
-            "s3_order_id":  s3_row.get("alpaca_order_id") if s3_open else None,
-            "has_stock":    has_stock,
+            "ticker":      key[0],
+            "option_type": key[1],
+            "trade":       trade_map.get(key, {}),
+            "s1_order_id": s1_row.get("alpaca_order_id"),
+            "s2_order_id": s2_row.get("alpaca_order_id") if s2_row else None,
+            "s3_order_id": s3_row.get("alpaca_order_id") if s3_open else None,
+            "has_stock":   has_stock,
         })
     return positions
 
 
-def do_close_all_positions(client, positions: list[dict],
-                            log_rows: list[dict]) -> list[dict]:
-    """
-    For each position:
-      1. Cancel Step 3 closing limit (if open)
-      2. Close stock leg: limit at ask (buy to cover CALL) or bid (sell PUT)
-      3. Close option leg: limit at midpoint
-    Logs each action and returns a results list.
-    """
+def do_close_all_positions(client, positions, log_rows):
     results = []
-
     for pos in positions:
         ticker      = pos["ticker"]
         option_type = pos["option_type"]
         trade       = pos["trade"]
-        result      = {"ticker": ticker, "option_type": option_type,
-                       "steps": [], "errors": []}
+        result      = {"ticker": ticker, "option_type": option_type, "steps": [], "errors": []}
+        base_log    = {**_base_log_row(trade, 0), "step": 0}  # step overridden below
 
-        base_log = {
-            "snapshot_date": str(trade.get("snapshot_date", "")),
-            "ticker":        ticker,
-            "option_type":   option_type,
-            "submitted_at":  datetime.now(timezone.utc).isoformat(),
-            "filled_at":     None,
-            "error_message": None,
-        }
-
-        # ── Step A: cancel Step 3 limit ──────────────────────────────────────
         if pos["s3_order_id"]:
             try:
                 alpaca_cancel_order(pos["s3_order_id"])
@@ -723,55 +620,39 @@ def do_close_all_positions(client, positions: list[dict],
             except Exception as e:
                 result["errors"].append(f"Cancel Step 3: {e}")
 
-        # ── Step B: close stock leg ───────────────────────────────────────────
         if pos["has_stock"]:
             try:
                 bid, ask = get_stock_quote(ticker)
                 is_call  = option_type.lower() == "call"
-                # CALL = short stock → buy to cover at ask
-                # PUT  = long stock  → sell at bid
-                close_side  = "buy" if is_call else "sell"
-                close_price = ask if is_call else bid
-                if close_price <= 0:
+                price    = ask if is_call else bid
+                if price <= 0:
                     raise ValueError(f"No live quote for {ticker}")
-
-                payload = {
-                    "symbol":        ticker.upper(),
-                    "qty":           "100",
-                    "side":          close_side,
-                    "type":          "limit",
-                    "limit_price":   str(round(close_price, 2)),
+                resp = alpaca_post("/v2/orders", {
+                    "symbol": ticker.upper(), "qty": "100",
+                    "side": "buy" if is_call else "sell",
+                    "type": "limit", "limit_price": str(round(price, 2)),
                     "time_in_force": "day",
-                }
-                resp = alpaca_post("/v2/orders", payload)
-                row  = {**base_log, "id": str(uuid.uuid4()), "step": 4,
-                        "alpaca_order_id": resp.get("id", ""), "status": "submitted"}
+                })
+                row = {**base_log, "id": str(uuid.uuid4()), "step": 4,
+                       "alpaca_order_id": resp.get("id", ""), "status": "submitted"}
                 ensure_log_table(client)
                 write_log_row(client, row)
                 log_rows.append(row)
-                result["steps"].append(f"Stock close submitted @ ${close_price:.2f}")
+                result["steps"].append(f"Stock close submitted @ ${price:.2f}")
             except Exception as e:
                 result["errors"].append(f"Close stock: {e}")
 
-        # ── Step C: close option leg ──────────────────────────────────────────
         try:
-            opt_symbol  = build_option_symbol(
-                ticker, trade.get("Option_Expiry_Date"),
-                option_type, trade.get("calls_strike", 0),
-            )
-            mid = get_option_midpoint(opt_symbol, trade.get("options_price", 1.00))
-            payload = {
-                "symbol":        opt_symbol,
-                "qty":           "1",
-                "side":          "sell",
-                "type":          "limit",
-                "limit_price":   str(mid),
-                "time_in_force": "day",
-                "asset_class":   "option",
-            }
-            resp = alpaca_post("/v2/orders", payload)
-            row  = {**base_log, "id": str(uuid.uuid4()), "step": 5,
-                    "alpaca_order_id": resp.get("id", ""), "status": "submitted"}
+            opt_sym = build_option_symbol(ticker, trade.get("Option_Expiry_Date"),
+                                          option_type, trade.get("calls_strike", 0))
+            mid = get_option_midpoint(opt_sym, trade.get("options_price", 1.00))
+            resp = alpaca_post("/v2/orders", {
+                "symbol": opt_sym, "qty": "1", "side": "sell",
+                "type": "limit", "limit_price": str(mid),
+                "time_in_force": "day", "asset_class": "option",
+            })
+            row = {**base_log, "id": str(uuid.uuid4()), "step": 5,
+                   "alpaca_order_id": resp.get("id", ""), "status": "submitted"}
             ensure_log_table(client)
             write_log_row(client, row)
             log_rows.append(row)
@@ -786,27 +667,68 @@ def do_close_all_positions(client, positions: list[dict],
 # ---------------------------------------------------------------------------
 # Investment summary
 # ---------------------------------------------------------------------------
+def _get_alpaca_positions() -> list[dict]:
+    try:
+        resp = requests.get(f"{ALPACA_BASE_URL}/v2/positions",
+                            headers=_acct_headers(), timeout=10)
+        resp.raise_for_status()
+        return resp.json() or []
+    except Exception:
+        return []
+
+
+def _get_alpaca_open_orders() -> list[dict]:
+    try:
+        resp = requests.get(f"{ALPACA_BASE_URL}/v2/orders",
+                            params={"status": "open", "limit": 500},
+                            headers=_acct_headers(), timeout=10)
+        resp.raise_for_status()
+        return resp.json() or []
+    except Exception:
+        return []
+
 
 def render_investment_summary(log_rows: list[dict], trades: list[dict]):
-    """
-    Show a summary bar: filled / pending / cancelled counts and
-    actual capital deployed fetched from Alpaca fill prices.
-    Scoped to the current snapshot date only.
-    """
-    # Scope strictly to tickers+option_type that are in the current loaded trades
-    # AND match the current snapshot date. Double filter prevents old filled entries
-    # for the same ticker from leaking through on repeat days.
-    snapshot_dates   = {str(t.get("snapshot_date", "")) for t in trades}
-    current_tickers  = {
-        (str(t.get("ticker", "")), str(t.get("option_type", "")))
-        for t in trades
+    account_id = _selected_account()
+    budget     = ACCOUNTS[account_id]["budget"]
+
+    current_tickers = {str(t.get("ticker", "")).upper() for t in trades}
+    current_option_symbols = {
+        build_option_symbol(t["ticker"], t["Option_Expiry_Date"], t["option_type"], t["calls_strike"])
+        for t in trades if t.get("ticker") and t.get("Option_Expiry_Date") and t.get("calls_strike")
     }
 
+    # ── All live data from Alpaca ──────────────────────────────────────────
+    positions   = _get_alpaca_positions()
+    open_orders = _get_alpaca_open_orders()
+
+    # Match only on option symbols (OCC format) — stock tickers are too broad
+    # and would catch pre-existing positions the app didn't place.
+    option_positions = [
+        p for p in positions
+        if p.get("symbol", "").upper() in current_option_symbols
+    ]
+    pending_orders = [
+        o for o in open_orders
+        if o.get("symbol", "").upper() in current_option_symbols
+        or any(
+            leg.get("symbol", "").upper() in current_option_symbols
+            for leg in (o.get("legs") or [])
+        )
+    ]
+
+    filled_count = len(option_positions)
+    deployed     = sum(abs(float(p.get("market_value") or 0)) for p in option_positions)
+    remaining    = budget - deployed
+
+    # Cancelled has no Alpaca source — log is the only record
+    snapshot_dates  = {str(t.get("snapshot_date", "")) for t in trades}
+    current_tk_type = {(str(t.get("ticker", "")), str(t.get("option_type", ""))) for t in trades}
     step1_rows = [
         r for r in log_rows
         if int(r.get("step") or 0) == 1
         and str(r.get("snapshot_date", "")) in snapshot_dates
-        and (str(r.get("ticker", "")), str(r.get("option_type", ""))) in current_tickers
+        and (str(r.get("ticker", "")), str(r.get("option_type", ""))) in current_tk_type
     ]
 
     def _sat(r):
@@ -820,7 +742,6 @@ def render_investment_summary(log_rows: list[dict], trades: list[dict]):
                 pass
         return datetime.min.replace(tzinfo=timezone.utc)
 
-    # Latest status per (ticker, option_type) — log is append-only so pick most recent
     seen, latest = set(), []
     for r in sorted(step1_rows, key=_sat, reverse=True):
         key = (r.get("ticker"), r.get("option_type"))
@@ -828,57 +749,45 @@ def render_investment_summary(log_rows: list[dict], trades: list[dict]):
             seen.add(key)
             latest.append(r)
 
-    filled    = [r for r in latest if r.get("status") == "filled"]
-    submitted = [r for r in latest if r.get("status") == "submitted"]
-    cancelled = [r for r in latest if r.get("status") == "cancelled_by_user"]
-    rejected  = [r for r in latest if r.get("status") in ("rejected", "failed")]
+    cancelled_count = sum(1 for r in latest if r.get("status") == "cancelled_by_user")
 
-    # Step 2 filled rows (stock leg) — same date + ticker scope
-    all_step2 = [
-        r for r in log_rows
-        if int(r.get("step") or 0) == 2
-        and str(r.get("snapshot_date", "")) in snapshot_dates
-        and (str(r.get("ticker", "")), str(r.get("option_type", ""))) in current_tickers
-    ]
-    seen2, latest2 = set(), []
-    for r in sorted(all_step2, key=_sat, reverse=True):
-        key = (r.get("ticker"), r.get("option_type"))
-        if key not in seen2:
-            seen2.add(key)
-            latest2.append(r)
-    filled2 = [r for r in latest2 if r.get("status") == "filled"]
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("🟢 Filled",    filled_count)
+    c2.metric("🔵 Pending",   len(pending_orders))
+    c3.metric("🚫 Cancelled", cancelled_count)
+    c4.metric("🔴 Rejected",  0)
+    c5.metric("💰 Deployed",  f"${deployed:,.0f}")
+    c6.metric("🏦 Remaining", f"${remaining:,.0f}",
+              delta=f"-${deployed:,.0f}" if deployed > 0 else None,
+              delta_color="inverse")
 
-    # Capital deployed = option cost (Step 1) + stock position value (Step 2)
-    # Option:  fill_px (premium/share) × 100 shares/contract  (1 contract per order)
-    # Stock:   fill_px (stock price)   × 100 shares
-    cache_key = "investment_summary_capital"
-    if cache_key not in st.session_state:
-        st.session_state[cache_key] = {}
 
-    def _fetch_cost(oid: str, multiplier: int) -> float:
-        if oid in st.session_state[cache_key]:
-            return st.session_state[cache_key][oid]
-        try:
-            order   = alpaca_get_order(oid)
-            fill_px = float(order.get("filled_avg_price") or 0)
-            cost    = fill_px * multiplier
-            st.session_state[cache_key][oid] = cost
-            return cost
-        except Exception:
-            return 0.0
-
-    capital = 0.0
-    for r in filled:                          # Step 1: option premium × 100
-        capital += _fetch_cost(r.get("alpaca_order_id", ""), 100)
-    for r in filled2:                         # Step 2: stock price × 100 shares
-        capital += _fetch_cost(r.get("alpaca_order_id", ""), 100)
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("🟢 Filled",    len(filled))
-    c2.metric("🔵 Pending",   len(submitted))
-    c3.metric("🚫 Cancelled", len(cancelled))
-    c4.metric("🔴 Rejected",  len(rejected))
-    c5.metric("💰 Deployed",  f"${capital:,.0f}")
+# ---------------------------------------------------------------------------
+# Account status bar
+# ---------------------------------------------------------------------------
+def render_account_status(account_id: str):
+    cfg = ACCOUNTS[account_id]
+    try:
+        resp = requests.get(f"{ALPACA_BASE_URL}/v2/account",
+                            headers=_acct_headers(), timeout=10)
+        resp.raise_for_status()
+        acct      = resp.json()
+        equity    = float(acct.get("equity", 0) or 0)
+        buying    = float(acct.get("buying_power", 0) or 0)
+        acct_type = "PAPER" if "paper" in ALPACA_BASE_URL else "LIVE"
+        st.markdown(
+            f'<div style="background:#1a1a2e;border:1px solid #333;border-radius:6px;'
+            f'padding:8px 16px;font-size:13px;margin-bottom:8px;">'
+            f'<b>{cfg["label"]}</b>&nbsp;'
+            f'<span style="background:#1a4a7a;padding:2px 6px;border-radius:3px;font-size:11px;">{acct_type}</span>'
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;<b>Equity:</b> ${equity:,.0f}'
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;<b>Buying Power:</b> ${buying:,.0f}'
+            f'&nbsp;&nbsp;|&nbsp;&nbsp;<b>Budget:</b> ${cfg["budget"]:,}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    except Exception as e:
+        st.warning(f"Could not fetch account info for {cfg['label']}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -894,82 +803,68 @@ RATING_ICON = {"green": "🟢", "yellow": "🟡", "red": "🔴", "grey": "⚪"}
 
 
 def render_liquidity_panel(trade: dict):
-    """Fetch and display liquidity metrics for Step 1 options."""
-    symbol = build_option_symbol(
-        trade["ticker"], trade["Option_Expiry_Date"],
-        trade["option_type"], trade["calls_strike"],
-    )
+    symbol    = build_option_symbol(trade["ticker"], trade["Option_Expiry_Date"],
+                                    trade["option_type"], trade["calls_strike"])
     cache_key = f"liq_{symbol}"
     if cache_key not in st.session_state:
         with st.spinner("Checking liquidity…"):
             st.session_state[cache_key] = get_option_liquidity(
-                symbol,
-                trade.get("calls_OpenInterest"),
-                trade.get("Volume"),
-            )
+                symbol, trade.get("calls_OpenInterest"), trade.get("Volume"))
     liq = st.session_state[cache_key]
 
-    verdict      = liq["verdict"]
-    verdict_icon, verdict_type = VERDICT_STYLE.get(verdict, ("⚪", "off"))
-
-    with st.expander(f"{verdict_icon} Liquidity: **{verdict}**  `{symbol}`", expanded=(verdict != "LIQUID")):
+    verdict_icon, _ = VERDICT_STYLE.get(liq["verdict"], ("⚪", "off"))
+    with st.expander(f"{verdict_icon} Liquidity: **{liq['verdict']}**  `{symbol}`",
+                     expanded=(liq["verdict"] != "LIQUID")):
         if liq["error"] and liq["bid"] is None:
             st.caption(f"Could not fetch live quote: {liq['error']}")
 
         c1, c2, c3 = st.columns(3)
-        # Spread %
-        spread_icon = RATING_ICON[liq["ratings"]["spread_pct"]]
-        spread_val  = f"{liq['spread_pct']}%" if liq["spread_pct"] is not None else "N/A"
-        spread_sub  = (f"Bid ${liq['bid']} / Ask ${liq['ask']}"
-                       if liq["bid"] else "No live quote")
-        c1.metric(f"{spread_icon} Spread", spread_val, spread_sub,
-                  delta_color="off")
-
-        # Open Interest
-        oi_icon = RATING_ICON[liq["ratings"]["open_interest"]]
-        c2.metric(f"{oi_icon} Open Interest", f"{liq['open_interest']:,}",
-                  "≥1000 liquid", delta_color="off")
-
-        # Volume
-        vol_icon = RATING_ICON[liq["ratings"]["volume"]]
-        c3.metric(f"{vol_icon} Volume", f"{liq['volume']:,}",
-                  "≥100 liquid", delta_color="off")
+        spread_val = f"{liq['spread_pct']}%" if liq["spread_pct"] is not None else "N/A"
+        spread_sub = f"Bid ${liq['bid']} / Ask ${liq['ask']}" if liq["bid"] else "No live quote"
+        c1.metric(f"{RATING_ICON[liq['ratings']['spread_pct']]} Spread",
+                  spread_val, spread_sub, delta_color="off")
+        c2.metric(f"{RATING_ICON[liq['ratings']['open_interest']]} Open Interest",
+                  f"{liq['open_interest']:,}", "≥1000 liquid", delta_color="off")
+        c3.metric(f"{RATING_ICON[liq['ratings']['volume']]} Volume",
+                  f"{liq['volume']:,}", "≥100 liquid", delta_color="off")
 
         if st.button("↻ Refresh quote", key=f"liq_refresh_{symbol}"):
             del st.session_state[cache_key]
             st.rerun()
 
 
-def render_step_cell(client, trade: dict, step: int, details: str, log_rows: list[dict], unlocked: bool):
+def render_step_cell(client, trade, step, details, log_rows, unlocked):
     ticker      = trade["ticker"]
     option_type = trade["option_type"]
     log_row     = get_step_status(log_rows, ticker, option_type, step)
     status      = log_row["status"] if log_row else "pending_approval"
-    badge       = STATUS_BADGE.get(status, status)
 
     if not unlocked:
         st.caption("🔒 Locked")
         return
 
-    st.caption(f"{details}")
-    st.caption(badge)
+    st.caption(details)
+    st.caption(STATUS_BADGE.get(status, status))
 
     if status == "pending_approval":
         if step == 1:
             render_liquidity_panel(trade)
+            acct_id = _selected_account()
+            st.info(f"Trading on: **{ACCOUNTS[acct_id]['label']}** | Budget: **${ACCOUNTS[acct_id]['budget']:,}**")
 
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("✅", key=f"approve_{ticker}_{option_type}_{step}", help="Approve", use_container_width=True):
+            if st.button("✅", key=f"approve_{ticker}_{option_type}_{step}",
+                         help="Approve", use_container_width=True):
                 do_approve(client, trade, step, log_rows)
                 st.rerun()
         with b2:
-            if st.button("❌", key=f"reject_{ticker}_{option_type}_{step}", help="Reject", use_container_width=True):
+            if st.button("❌", key=f"reject_{ticker}_{option_type}_{step}",
+                         help="Reject", use_container_width=True):
                 do_reject(client, trade, step, log_rows)
                 st.rerun()
 
     if status == "submitted" and step == 1:
-        # Time elapsed since submission
         submitted_at = log_row.get("submitted_at") if log_row else None
         if submitted_at:
             if isinstance(submitted_at, str):
@@ -980,14 +875,10 @@ def render_step_cell(client, trade: dict, step: int, details: str, log_rows: lis
             if submitted_at:
                 if submitted_at.tzinfo is None:
                     submitted_at = submitted_at.replace(tzinfo=timezone.utc)
-                elapsed     = datetime.now(timezone.utc) - submitted_at
-                total_secs  = int(elapsed.total_seconds())
-                if total_secs < 3600:
-                    elapsed_str = f"{total_secs // 60}m {total_secs % 60}s ago"
-                else:
-                    h = total_secs // 3600
-                    m = (total_secs % 3600) // 60
-                    elapsed_str = f"{h}h {m}m ago"
+                elapsed    = datetime.now(timezone.utc) - submitted_at
+                total_secs = int(elapsed.total_seconds())
+                elapsed_str = (f"{total_secs // 60}m {total_secs % 60}s ago" if total_secs < 3600
+                               else f"{total_secs // 3600}h {(total_secs % 3600) // 60}m ago")
                 st.caption(f"⏱ {elapsed_str}")
 
         with st.expander("Order not filling? Retry / Cancel"):
@@ -995,7 +886,7 @@ def render_step_cell(client, trade: dict, step: int, details: str, log_rows: lis
             r1, r2, r3 = st.columns(3)
             with r1:
                 if st.button("Retry at Ask", key=f"retry_ask_{ticker}_{option_type}",
-                             use_container_width=True, help="Limit order at current ask price"):
+                             use_container_width=True, help="Limit at current ask"):
                     do_retry_step1(client, trade, log_rows, mode="ask")
                     st.rerun()
             with r2:
@@ -1006,56 +897,63 @@ def render_step_cell(client, trade: dict, step: int, details: str, log_rows: lis
                     st.rerun()
             with r3:
                 if st.button("Cancel", key=f"cancel_s1_{ticker}_{option_type}",
-                             use_container_width=True, type="secondary",
-                             help="Cancel order — logged as Cancelled by user"):
+                             use_container_width=True, type="secondary"):
                     do_cancel_step1(client, trade, log_rows)
                     st.rerun()
 
 
 def render_table_header():
-    cols = st.columns([1, 1, 1, 1, 1, 4, 2, 2])
+    cols   = st.columns([1, 1, 1, 1, 1, 4, 2, 2])
     labels = ["Type", "Ticker", "Conf%", "Strike", "Expiry", "Step 1", "Step 2", "Step 3"]
     for col, label in zip(cols, labels):
         col.markdown(f"**{label}**")
     st.divider()
 
 
-def render_trade_row(client, trade: dict, log_rows: list[dict]):
+def render_trade_row(client, trade, log_rows, running_cost, budget):
     ticker      = trade["ticker"]
     option_type = trade["option_type"].upper()
     conf        = float(trade.get("prediction_prob", 0)) * 100
     expiry      = trade.get("Option_Expiry_Date", "")
     strike      = trade.get("calls_strike", "")
+    est_cost    = float(trade.get("options_price", 0)) * 100
 
-    s1 = get_step_status(log_rows, ticker, trade["option_type"], 1)
-    s2 = get_step_status(log_rows, ticker, trade["option_type"], 2)
+    s1        = get_step_status(log_rows, ticker, trade["option_type"], 1)
+    s2        = get_step_status(log_rows, ticker, trade["option_type"], 2)
     s1_status = s1["status"] if s1 else "pending_approval"
     s2_status = s2["status"] if s2 else "pending_approval"
 
     if option_type == "CALL":
         step1_details = f"Buy 1 CALL @ ${strike}"
-        step2_details = f"Sell 100 shares @ mkt"
-        step3_details = f"Buy 100 @ (S2 fill − S1 fill)"
+        step2_details = "Sell 100 shares @ mkt"
+        step3_details = "Buy 100 @ (S2 fill − S1 fill)"
     else:
         step1_details = f"Buy 1 PUT @ ${strike}"
-        step2_details = f"Buy 100 shares @ mkt"
-        step3_details = f"Sell 100 @ (S2 fill + S1 fill)"
+        step2_details = "Buy 100 shares @ mkt"
+        step3_details = "Sell 100 @ (S2 fill + S1 fill)"
+
+    if s1_status == "pending_approval" and (running_cost + est_cost) > budget:
+        st.warning(
+            f"⚠️ **{ticker}** est. option cost ${est_cost:,.0f} — "
+            f"running total ${running_cost + est_cost:,.0f} exceeds ${budget:,} budget."
+        )
 
     badge_color = "#1a6e3c" if option_type == "CALL" else "#6e1a1a"
-    type_badge  = f'<span style="background:{badge_color};padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold;">{option_type}</span>'
+    type_badge  = (f'<span style="background:{badge_color};padding:2px 8px;'
+                   f'border-radius:4px;font-size:12px;font-weight:bold;">{option_type}</span>')
 
     c_type, c_ticker, c_conf, c_strike, c_expiry, c_s1, c_s2, c_s3 = st.columns([1, 1, 1, 1, 1, 4, 2, 2])
-
-    with c_type:    st.markdown(type_badge, unsafe_allow_html=True)
-    with c_ticker:  st.markdown(f"**{ticker}**")
-    with c_conf:    st.markdown(f"{conf:.1f}%")
-    with c_strike:  st.markdown(f"${strike}")
-    with c_expiry:  st.markdown(str(expiry))
-    with c_s1:      render_step_cell(client, trade, 1, step1_details, log_rows, unlocked=True)
-    with c_s2:      render_step_cell(client, trade, 2, step2_details, log_rows, unlocked=(s1_status == "filled"))
-    with c_s3:      render_step_cell(client, trade, 3, step3_details, log_rows, unlocked=(s2_status == "filled"))
+    with c_type:   st.markdown(type_badge, unsafe_allow_html=True)
+    with c_ticker: st.markdown(f"**{ticker}**")
+    with c_conf:   st.markdown(f"{conf:.1f}%")
+    with c_strike: st.markdown(f"${strike}")
+    with c_expiry: st.markdown(str(expiry))
+    with c_s1:     render_step_cell(client, trade, 1, step1_details, log_rows, unlocked=True)
+    with c_s2:     render_step_cell(client, trade, 2, step2_details, log_rows, unlocked=(s1_status == "filled"))
+    with c_s3:     render_step_cell(client, trade, 3, step3_details, log_rows, unlocked=(s2_status == "filled"))
 
     st.divider()
+    return running_cost + est_cost
 
 
 # ---------------------------------------------------------------------------
@@ -1065,54 +963,77 @@ def main():
     st.set_page_config(page_title="Order Desk", layout="wide")
     st.title("Order Desk")
 
-    # Liquidity thresholds legend
+    # ── Account switcher ────────────────────────────────────────────────────
+    account_options = {v["label"]: k for k, v in ACCOUNTS.items()}
+    prev_account    = st.session_state.get("selected_account", "paper95k")
+
+    selected_label   = st.selectbox(
+        "Account", options=list(account_options.keys()),
+        index=list(account_options.values()).index(prev_account),
+        label_visibility="collapsed",
+    )
+    selected_account = account_options[selected_label]
+
+    if selected_account != prev_account:
+        for key in [k for k in st.session_state if k.startswith(f"{prev_account}_")]:
+            del st.session_state[key]
+        st.session_state.selected_account = selected_account
+        st.rerun()
+
+    st.session_state.selected_account = selected_account
+
+    # Liquidity legend
     st.markdown(
-        """
-        <div style="background:#1e1e1e;border:1px solid #333;border-radius:6px;
-                    padding:8px 16px;font-size:13px;margin-bottom:8px;">
-          <b>Liquidity thresholds</b> &nbsp;|&nbsp;
-          <b>Spread %</b>: 🟢 &lt;5% &nbsp; 🟡 5–15% &nbsp; 🔴 &gt;15%
-          &nbsp;&nbsp;|&nbsp;&nbsp;
-          <b>Open Interest</b>: 🟢 &gt;1000 &nbsp; 🟡 500–1000 &nbsp; 🔴 &lt;500
-          &nbsp;&nbsp;|&nbsp;&nbsp;
-          <b>Volume</b>: 🟢 &gt;100 &nbsp; 🟡 50–100 &nbsp; 🔴 &lt;50
-        </div>
-        """,
+        '<div style="background:#1e1e1e;border:1px solid #333;border-radius:6px;'
+        'padding:8px 16px;font-size:13px;margin-bottom:8px;">'
+        '<b>Liquidity thresholds</b> &nbsp;|&nbsp;'
+        '<b>Spread %</b>: 🟢 &lt;5% &nbsp; 🟡 5–15% &nbsp; 🔴 &gt;15%'
+        '&nbsp;&nbsp;|&nbsp;&nbsp;'
+        '<b>Open Interest</b>: 🟢 &gt;1000 &nbsp; 🟡 500–1000 &nbsp; 🔴 &lt;500'
+        '&nbsp;&nbsp;|&nbsp;&nbsp;'
+        '<b>Volume</b>: 🟢 &gt;100 &nbsp; 🟡 50–100 &nbsp; 🔴 &lt;50'
+        '</div>',
         unsafe_allow_html=True,
     )
 
-    # Credential check
     if MISSING_CREDS:
-        st.error(f"Missing required environment variables: {', '.join(MISSING_CREDS)}. "
-                 f"Copy .env.example to .env and fill in the values.")
+        st.error(f"Missing required environment variables: {', '.join(MISSING_CREDS)}.")
         st.stop()
 
-    # BQ client
+    cfg = ACCOUNTS[selected_account]
+    if not os.getenv(cfg["api_key_env"]) or not os.getenv(cfg["secret_env"]):
+        st.error(f"Missing credentials for **{cfg['label']}**: "
+                 f"set `{cfg['api_key_env']}` and `{cfg['secret_env']}` in your .env file.")
+        st.stop()
+
+    render_account_status(selected_account)
+
     try:
         client = get_bq_client()
     except Exception as e:
         st.error(f"Failed to connect to BigQuery: {e}")
         st.stop()
 
-    # Session state init
-    if "trades" not in st.session_state:
-        st.session_state.trades        = None
-        st.session_state.log_rows      = None
-        st.session_state.show_close_confirm = False
+    trades_key  = f"{selected_account}_trades"
+    log_key     = f"{selected_account}_log_rows"
+    confirm_key = f"{selected_account}_show_close_confirm"
 
-    # Top bar
+    if trades_key not in st.session_state:
+        st.session_state[trades_key]  = None
+        st.session_state[log_key]     = None
+        st.session_state[confirm_key] = False
+
     col_title, col_refresh, col_close = st.columns([6, 2, 2])
     with col_refresh:
         refresh_clicked = st.button("🔄 Refresh Status", use_container_width=True)
     with col_close:
         if st.button("🔴 Close All Positions", use_container_width=True):
-            st.session_state.show_close_confirm = True
+            st.session_state[confirm_key] = True
 
-    # Load / refresh data
-    if st.session_state.trades is None or refresh_clicked:
+    if st.session_state[trades_key] is None or refresh_clicked:
         with st.spinner("Loading trades from BigQuery…"):
             try:
-                st.session_state.trades = fetch_trades(client)
+                st.session_state[trades_key] = fetch_trades(client)
             except Exception as e:
                 st.error(f"BigQuery read error: {e}")
                 st.stop()
@@ -1120,21 +1041,20 @@ def main():
         with st.spinner("Loading order log…"):
             try:
                 ensure_log_table(client)
-                st.session_state.log_rows = fetch_log(client)
+                st.session_state[log_key] = fetch_log(client, selected_account)
             except Exception as e:
                 st.error(f"Log table error: {e}")
-                st.session_state.log_rows = []
+                st.session_state[log_key] = []
 
         if refresh_clicked:
-            st.session_state.pop("investment_summary_capital", None)
-            updated = refresh_all_statuses(client, st.session_state.log_rows)
+            updated = refresh_all_statuses(client, st.session_state[log_key])
             if updated:
                 st.success(f"Updated {updated} order(s) from Alpaca.")
             else:
                 st.info("No status changes from Alpaca.")
 
-    trades   = st.session_state.trades
-    log_rows = st.session_state.log_rows
+    trades   = st.session_state[trades_key]
+    log_rows = st.session_state[log_key]
 
     if not trades:
         st.info("No trades with evaluation_status = 'PENDING_NEXT_DAY_DATA' found.")
@@ -1144,15 +1064,14 @@ def main():
     render_investment_summary(log_rows, trades)
     st.markdown("---")
 
-    # Close All Positions confirmation panel
-    if st.session_state.get("show_close_confirm"):
+    if st.session_state.get(confirm_key):
         snapshot_dates  = {str(t.get("snapshot_date", "")) for t in trades}
         current_tickers = {(str(t.get("ticker", "")), str(t.get("option_type", ""))) for t in trades}
-        positions = get_active_positions(log_rows, trades, snapshot_dates, current_tickers)
+        positions       = get_active_positions(log_rows, trades, snapshot_dates, current_tickers)
 
         if not positions:
             st.warning("No filled positions found to close.")
-            st.session_state.show_close_confirm = False
+            st.session_state[confirm_key] = False
         else:
             st.error("**Confirm: Close All Positions**")
             for p in positions:
@@ -1167,21 +1086,20 @@ def main():
                         results = do_close_all_positions(client, positions, log_rows)
                     for r in results:
                         if r["errors"]:
-                            st.error(f"{r['ticker']} {r['option_type'].upper()}: "
-                                     + " | ".join(r["errors"]))
+                            st.error(f"{r['ticker']} {r['option_type'].upper()}: " + " | ".join(r["errors"]))
                         else:
-                            st.success(f"{r['ticker']} {r['option_type'].upper()}: "
-                                       + " → ".join(r["steps"]))
-                    st.session_state.show_close_confirm = False
-                    st.session_state.pop("investment_summary_capital", None)
+                            st.success(f"{r['ticker']} {r['option_type'].upper()}: " + " → ".join(r["steps"]))
+                    st.session_state[confirm_key] = False
             with c2:
                 if st.button("Cancel", use_container_width=True):
-                    st.session_state.show_close_confirm = False
+                    st.session_state[confirm_key] = False
                     st.rerun()
 
     render_table_header()
+    budget       = ACCOUNTS[selected_account]["budget"]
+    running_cost = 0.0
     for trade in trades:
-        render_trade_row(client, trade, log_rows)
+        running_cost = render_trade_row(client, trade, log_rows, running_cost, budget)
 
 
 if __name__ == "__main__":
